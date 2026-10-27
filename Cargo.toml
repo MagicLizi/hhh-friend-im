@@ -24,7 +24,7 @@ path = "src/main.rs"
 # 连服务器、核对、加解密都在客户端库里；插件只把它翻成 HHH 的插件协议。
 friend-im-client = { path = "client" }
 # 协议包：固定已发布标签，支持宿主交本机用户头像（account/avatar，协议 v35）。
-hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.10.0" }
+hhh-im-protocol = { git = "https://github.com/MagicLizi/hhh-im-sdk", tag = "v0.14.0" }
 # 异步运行时：读标准输入、并发处理宿主的请求、推送队列。
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "fs"] }
 serde = { version = "1", features = ["derive"] }

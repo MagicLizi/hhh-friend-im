@@ -49,7 +49,10 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { push_retry: Duration::from_secs(1), send_wait: Duration::from_secs(50) }
+        Self {
+            push_retry: Duration::from_secs(1),
+            send_wait: Duration::from_secs(50),
+        }
     }
 }
 
@@ -77,7 +80,10 @@ pub(crate) struct Server {
 
 /// 现在的时间（Unix 毫秒）。
 pub(crate) fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// 用标准输入、标准输出跑协议服务，直到宿主关掉标准输入；日志交给宿主（`log/write`）。
@@ -88,7 +94,13 @@ pub async fn run_stdio() {
     #[cfg(not(target_os = "wasi"))]
     serve_with(server, tokio::io::stdin(), tokio::io::stdout(), writes).await;
     #[cfg(target_os = "wasi")]
-    serve_with(server, crate::wasi_stdio::Stdin::new(), crate::wasi_stdio::Stdout, writes).await;
+    serve_with(
+        server,
+        crate::wasi_stdio::Stdin::new(),
+        crate::wasi_stdio::Stdout,
+        writes,
+    )
+    .await;
 }
 
 /// 在给定的输入、输出上跑协议服务（测试用进程内的管道），直到输入关掉。
@@ -101,8 +113,12 @@ where
     serve_with(server, input, output, writes).await;
 }
 
-async fn serve_with<R, W>(server: Arc<Server>, input: R, output: W, writes: mpsc::UnboundedReceiver<RpcMessage>)
-where
+async fn serve_with<R, W>(
+    server: Arc<Server>,
+    input: R,
+    output: W,
+    writes: mpsc::UnboundedReceiver<RpcMessage>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -126,7 +142,13 @@ where
         }
     }
     // 宿主关了标准输入：停掉还在跑的请求，断开服务器。
-    let handles: Vec<AbortHandle> = server.tasks.lock().expect("任务表锁中毒").drain().map(|(_, handle)| handle).collect();
+    let handles: Vec<AbortHandle> = server
+        .tasks
+        .lock()
+        .expect("任务表锁中毒")
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect();
     for handle in handles {
         handle.abort();
     }
@@ -135,7 +157,10 @@ where
 }
 
 /// 写手：一条一行写到输出，每条都立刻送出去。
-async fn write_loop<W: AsyncWrite + Unpin>(mut output: W, mut writes: mpsc::UnboundedReceiver<RpcMessage>) {
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut output: W,
+    mut writes: mpsc::UnboundedReceiver<RpcMessage>,
+) {
     while let Some(message) = writes.recv().await {
         let Ok(line) = codec::encode_line(&message) else {
             continue;
@@ -188,7 +213,11 @@ impl Server {
             if let Some(result) = server.handle(&id, &method, params).await {
                 server.peer.respond(id.clone(), result);
             }
-            server.tasks.lock().expect("任务表锁中毒").remove(&id.to_string());
+            server
+                .tasks
+                .lock()
+                .expect("任务表锁中毒")
+                .remove(&id.to_string());
         });
         tasks.insert(key, task.abort_handle());
     }
@@ -197,30 +226,48 @@ impl Server {
     fn notified(&self, method: &str, params: Value) {
         match method {
             "$/cancel" => {
-                let Ok(cancel) = serde_json::from_value::<hhh_im_protocol::method::CancelParams>(params) else {
+                let Ok(cancel) =
+                    serde_json::from_value::<hhh_im_protocol::method::CancelParams>(params)
+                else {
                     return;
                 };
-                let handle = self.tasks.lock().expect("任务表锁中毒").remove(&cancel.id.to_string());
+                let handle = self
+                    .tasks
+                    .lock()
+                    .expect("任务表锁中毒")
+                    .remove(&cancel.id.to_string());
                 if let Some(handle) = handle {
                     handle.abort();
-                    self.peer.respond(cancel.id, Err(errors::of(ErrorKind::Cancelled, "宿主取消了这个请求。")));
+                    self.peer.respond(
+                        cancel.id,
+                        Err(errors::of(ErrorKind::Cancelled, "宿主取消了这个请求。")),
+                    );
                 }
             }
-            "login/submit" | "login/cancel" | "action/submit" | "action/cancel" | "step/choose" => self.flows.notified(method, params),
+            "login/submit" | "login/cancel" | "action/submit" | "action/cancel" | "step/choose" => {
+                self.flows.notified(method, params)
+            }
             other => tracing::debug!(method = other, "不认识的通知，忽略"),
         }
     }
 
     /// 宿主发来的请求；回 `None` 表示已经自己回过了（`login/start`、`actions/start`：先回流程编号，再推第一步）。
-    async fn handle(self: &Arc<Self>, id: &RpcId, method: &str, value: Value) -> Option<Result<Value, hhh_im_protocol::RpcError>> {
+    async fn handle(
+        self: &Arc<Self>,
+        id: &RpcId,
+        method: &str,
+        value: Value,
+    ) -> Option<Result<Value, hhh_im_protocol::RpcError>> {
         let Some(known) = Method::from_name(method) else {
             return Some(Err(errors::method_not_found(method)));
         };
         Some(match known {
-            Method::Initialize => params(value).and_then(|p: hhh_im_protocol::method::InitializeParams| {
-                self.uploads.set_dir(&p.temp_dir);
-                declare::initialize(&p)
-            }),
+            Method::Initialize => {
+                params(value).and_then(|p: hhh_im_protocol::method::InitializeParams| {
+                    self.uploads.set_dir(&p.temp_dir);
+                    declare::initialize(&p)
+                })
+            }
             Method::Ping => Ok(serde_json::json!({})),
             Method::Shutdown => {
                 self.close_session().await;
@@ -261,6 +308,10 @@ impl Server {
             },
             Method::MessagesList => match params(value) {
                 Ok(p) => self.messages_list(p).await,
+                Err(error) => Err(error),
+            },
+            Method::ResourcesDescribe => match params(value) {
+                Ok(p) => self.describe_resource(p).await,
                 Err(error) => Err(error),
             },
             Method::ResourcesRead => match params(value) {

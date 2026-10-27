@@ -57,7 +57,7 @@ cargo test --workspace   # 插件、共用部分与客户端库（含锁住线�
 打包插件：
 
 ```sh
-cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.3.0 hhh-im-protocol --features transport,package
+cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.14.0 hhh-im-protocol --features transport,package
 powershell -File scripts/pack.ps1     # Windows（官方版本加 -SignKey <hhh-keys>/official/hhh-official-signing.key）
 scripts/pack.sh                       # macOS / Linux
 hhh-im-check dist/stage/hhh-im-provider.json
@@ -75,3 +75,9 @@ WASI_SDK_PATH=<wasi-sdk 目录> scripts/pack-ios.sh   # 出 dist/friend-im-<版�
 ## 许可证
 
 [MIT](LICENSE)。
+
+## 图片的预览与原件
+
+同一份加密附件解密后的实际字节同时用于图片显示和原件保存，只声明一个版本供宿主共用缓存。
+
+新宿主经 `resources/describe` 选择实际版本，读取时带 `variant`；省略 `variant` 的旧调用仍按原来的方式读取；二进制安装仍需通过宿主的最低 SDK 检查。分段缓存包含实际版本，不把预览当成原件。本版固定使用 IM SDK v0.14.0，宿主需支持该版 SDK。

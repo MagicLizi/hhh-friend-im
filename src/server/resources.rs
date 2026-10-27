@@ -17,8 +17,8 @@ use friend_im_client::core::file::FILE_NAME_MAX_CHARS;
 use friend_im_client::core::ids::MsgId;
 use friend_im_client::core::limits;
 use hhh_im_protocol::method::{
-    ResourceChunk, ResourcesReadParams, UploadsAbortParams, UploadsBeginParams, UploadsBeginResult, UploadsChunkParams, UploadsFinishParams,
-    UploadsFinishResult,
+    ResourceChunk, ResourcesReadParams, UploadsAbortParams, UploadsBeginParams, UploadsBeginResult,
+    UploadsChunkParams, UploadsFinishParams, UploadsFinishResult,
 };
 use hhh_im_protocol::rpc::{ErrorKind, RpcError};
 use hhh_im_protocol::types::ResourceKind;
@@ -73,7 +73,11 @@ mod fs {
     }
 
     impl tokio::io::AsyncWrite for File {
-        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
             Poll::Ready(self.0.write(buf))
         }
 
@@ -81,7 +85,10 @@ mod fs {
             Poll::Ready(self.0.flush())
         }
 
-        fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(self.0.flush())
         }
     }
@@ -130,7 +137,10 @@ impl Uploads {
     }
 
     fn dir(&self) -> PathBuf {
-        self.dir.get().cloned().unwrap_or_else(|| std::env::temp_dir().join("friend-im-uploads"))
+        self.dir
+            .get()
+            .cloned()
+            .unwrap_or_else(|| std::env::temp_dir().join("friend-im-uploads"))
     }
 
     /// 要发的一个附件（还在暂存区、已经传完）。
@@ -138,12 +148,19 @@ impl Uploads {
         let id = key.strip_prefix(KEY_PREFIX)?;
         let staged = self.staged.lock().await;
         let found = staged.get(id).filter(|s| s.finished)?;
-        Some(Attachment { path: found.path.clone(), name: found.name.clone(), bytes: found.bytes, image: found.kind == ResourceKind::Image })
+        Some(Attachment {
+            path: found.path.clone(),
+            name: found.name.clone(),
+            bytes: found.bytes,
+            image: found.kind == ResourceKind::Image,
+        })
     }
 
     /// 发出去了：删掉暂存。
     pub(crate) async fn done(&self, key: &str) {
-        let Some(id) = key.strip_prefix(KEY_PREFIX) else { return };
+        let Some(id) = key.strip_prefix(KEY_PREFIX) else {
+            return;
+        };
         if let Some(staged) = self.staged.lock().await.remove(id) {
             remove(&staged.path).await;
         }
@@ -163,30 +180,80 @@ fn to_value(value: impl serde::Serialize) -> Value {
 }
 
 impl Server {
+    /// Cindy IM 只存一份加密附件，解密后的同一份字节用于显示和保存。
+    pub(crate) async fn describe_resource(
+        &self,
+        params: hhh_im_protocol::method::ResourcesDescribeParams,
+    ) -> Result<Value, RpcError> {
+        self.live().await?;
+        let file = translate::file_of_key(&params.key)
+            .ok_or_else(|| errors::of(ErrorKind::NotFound, "这个附件的编号不对。"))?;
+        Ok(to_value(hhh_im_protocol::ResourceVariants {
+            variants: vec![hhh_im_protocol::ResourceVariant {
+                id: "file".into(),
+                preview: params.kind == ResourceKind::Image,
+                original: true,
+                bytes: Some(file.size),
+                ..Default::default()
+            }],
+        }))
+    }
+
     /// `resources/read`：读一段图片或文件。
-    pub(crate) async fn read_resource(&self, params: ResourcesReadParams) -> Result<Value, RpcError> {
+    pub(crate) async fn read_resource(
+        &self,
+        params: ResourcesReadParams,
+    ) -> Result<Value, RpcError> {
+        if params.variant.as_deref().is_some_and(|id| id != "file") {
+            return Err(errors::of(
+                ErrorKind::NotFound,
+                "Cindy IM 没有这个附件版本。",
+            ));
+        }
         let live = self.live().await?;
-        let file = translate::file_of_key(&params.key).ok_or_else(|| errors::of(ErrorKind::NotFound, "这个附件的编号不对。"))?;
+        let file = translate::file_of_key(&params.key)
+            .ok_or_else(|| errors::of(ErrorKind::NotFound, "这个附件的编号不对。"))?;
         if params.offset > file.size {
-            return Err(errors::of(ErrorKind::InvalidRequest, "读的位置超出了文件大小。"));
+            return Err(errors::of(
+                ErrorKind::InvalidRequest,
+                "读的位置超出了文件大小。",
+            ));
         }
         let length = params.length.min(SEGMENT_MAX);
-        let data = live.client.read_range(&file, params.offset, length).await.map_err(|error| {
-            tracing::info!(file = %file.id, offset = params.offset, %error, "读附件没成");
-            errors::client(&error)
-        })?;
+        let data = live
+            .client
+            .read_range(&file, params.offset, length)
+            .await
+            .map_err(|error| {
+                tracing::info!(file = %file.id, offset = params.offset, %error, "读附件没成");
+                errors::client(&error)
+            })?;
         let eof = params.offset + data.len() as u64 >= file.size;
-        Ok(to_value(ResourceChunk { data: BASE64.encode(&data), total: Some(file.size), sha256: None, eof }))
+        Ok(to_value(ResourceChunk {
+            data: BASE64.encode(&data),
+            total: Some(file.size),
+            sha256: None,
+            eof,
+        }))
     }
 
     /// `uploads/begin`：开一份暂存。
     pub(crate) async fn upload_begin(&self, params: UploadsBeginParams) -> Result<Value, RpcError> {
         if params.bytes > limits::FILE_PLAIN_MAX {
-            return Err(errors::of(ErrorKind::LimitExceeded, "附件超过 100 MiB，Cindy IM 发不了。"));
+            return Err(errors::of(
+                ErrorKind::LimitExceeded,
+                "附件超过 100 MiB，Cindy IM 发不了。",
+            ));
         }
         let name = params.name.trim();
-        if name.is_empty() || name.chars().count() > FILE_NAME_MAX_CHARS || name.chars().any(char::is_control) {
-            return Err(errors::of(ErrorKind::InvalidRequest, "附件的文件名不对（不能为空、不超过 255 个字）。"));
+        if name.is_empty()
+            || name.chars().count() > FILE_NAME_MAX_CHARS
+            || name.chars().any(char::is_control)
+        {
+            return Err(errors::of(
+                ErrorKind::InvalidRequest,
+                "附件的文件名不对（不能为空、不超过 255 个字）。",
+            ));
         }
         let dir = self.uploads.dir();
         fs::create_dir_all(&dir).await.map_err(|error| {
@@ -201,9 +268,17 @@ impl Server {
         })?;
         let mut staged = self.uploads.staged.lock().await;
         let now = Instant::now();
-        let mut expired: Vec<String> = staged.iter().filter(|(_, s)| now.duration_since(s.created) > STAGED_TTL).map(|(k, _)| k.clone()).collect();
+        let mut expired: Vec<String> = staged
+            .iter()
+            .filter(|(_, s)| now.duration_since(s.created) > STAGED_TTL)
+            .map(|(k, _)| k.clone())
+            .collect();
         if staged.len() - expired.len() >= STAGED_MAX
-            && let Some(oldest) = staged.iter().filter(|(k, _)| !expired.contains(k)).min_by_key(|(_, s)| s.created).map(|(k, _)| k.clone())
+            && let Some(oldest) = staged
+                .iter()
+                .filter(|(k, _)| !expired.contains(k))
+                .min_by_key(|(_, s)| s.created)
+                .map(|(k, _)| k.clone())
         {
             expired.push(oldest);
         }
@@ -214,26 +289,52 @@ impl Server {
         }
         staged.insert(
             id.clone(),
-            Staged { path, name: name.to_owned(), kind: params.kind, bytes: params.bytes, written: 0, hasher: Sha256::new(), finished: false, created: now },
+            Staged {
+                path,
+                name: name.to_owned(),
+                kind: params.kind,
+                bytes: params.bytes,
+                written: 0,
+                hasher: Sha256::new(),
+                finished: false,
+                created: now,
+            },
         );
         Ok(to_value(UploadsBeginResult { upload_id: id }))
     }
 
     /// `uploads/chunk`：按顺序写进暂存。
     pub(crate) async fn upload_chunk(&self, params: UploadsChunkParams) -> Result<Value, RpcError> {
-        let data = BASE64.decode(&params.data).map_err(|_| errors::of(ErrorKind::InvalidRequest, "上传的这一段不是合法的 base64。"))?;
+        let data = BASE64.decode(&params.data).map_err(|_| {
+            errors::of(ErrorKind::InvalidRequest, "上传的这一段不是合法的 base64。")
+        })?;
         let mut staged = self.uploads.staged.lock().await;
-        let entry = staged.get_mut(&params.upload_id).ok_or_else(|| errors::of(ErrorKind::NotFound, "没有这次上传（可能已经过期），要重新上传。"))?;
+        let entry = staged.get_mut(&params.upload_id).ok_or_else(|| {
+            errors::of(
+                ErrorKind::NotFound,
+                "没有这次上传（可能已经过期），要重新上传。",
+            )
+        })?;
         if entry.finished || params.offset != entry.written {
-            return Err(errors::of(ErrorKind::InvalidRequest, format!("上传的这一段位置不对：应该从 {} 开始。", entry.written)));
+            return Err(errors::of(
+                ErrorKind::InvalidRequest,
+                format!("上传的这一段位置不对：应该从 {} 开始。", entry.written),
+            ));
         }
         if entry.written + data.len() as u64 > entry.bytes {
-            return Err(errors::of(ErrorKind::InvalidRequest, "上传的内容比说好的大。"));
+            return Err(errors::of(
+                ErrorKind::InvalidRequest,
+                "上传的内容比说好的大。",
+            ));
         }
-        let mut file = fs::OpenOptions::new().append(true).open(&entry.path).await.map_err(|error| {
-            tracing::error!(%error, "打不开暂存文件");
-            errors::of(ErrorKind::Disconnected, "插件的临时目录写不进去。")
-        })?;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&entry.path)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "打不开暂存文件");
+                errors::of(ErrorKind::Disconnected, "插件的临时目录写不进去。")
+            })?;
         file.write_all(&data).await.map_err(|error| {
             tracing::error!(%error, "写不进暂存文件");
             errors::of(ErrorKind::Disconnected, "插件的临时目录写不进去。")
@@ -244,18 +345,43 @@ impl Server {
     }
 
     /// `uploads/finish`：核对长度与摘要，给出发送时用的键。
-    pub(crate) async fn upload_finish(&self, params: UploadsFinishParams) -> Result<Value, RpcError> {
+    pub(crate) async fn upload_finish(
+        &self,
+        params: UploadsFinishParams,
+    ) -> Result<Value, RpcError> {
         let mut staged = self.uploads.staged.lock().await;
-        let entry = staged.get_mut(&params.upload_id).ok_or_else(|| errors::of(ErrorKind::NotFound, "没有这次上传（可能已经过期），要重新上传。"))?;
+        let entry = staged.get_mut(&params.upload_id).ok_or_else(|| {
+            errors::of(
+                ErrorKind::NotFound,
+                "没有这次上传（可能已经过期），要重新上传。",
+            )
+        })?;
         if entry.written != entry.bytes {
-            return Err(errors::of(ErrorKind::InvalidRequest, format!("上传不完整：收到 {} 字节，说好的是 {} 字节。", entry.written, entry.bytes)));
+            return Err(errors::of(
+                ErrorKind::InvalidRequest,
+                format!(
+                    "上传不完整：收到 {} 字节，说好的是 {} 字节。",
+                    entry.written, entry.bytes
+                ),
+            ));
         }
-        let digest: String = entry.hasher.clone().finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let digest: String = entry
+            .hasher
+            .clone()
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         if !digest.eq_ignore_ascii_case(params.sha256.trim()) {
-            return Err(errors::of(ErrorKind::InvalidRequest, "上传的内容和摘要对不上。"));
+            return Err(errors::of(
+                ErrorKind::InvalidRequest,
+                "上传的内容和摘要对不上。",
+            ));
         }
         entry.finished = true;
-        Ok(to_value(UploadsFinishResult { key: format!("{KEY_PREFIX}{}", params.upload_id) }))
+        Ok(to_value(UploadsFinishResult {
+            key: format!("{KEY_PREFIX}{}", params.upload_id),
+        }))
     }
 
     /// `uploads/abort`：放弃，删掉暂存。

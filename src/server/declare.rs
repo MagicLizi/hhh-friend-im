@@ -12,8 +12,8 @@ use hhh_im_protocol::method::{
     ActionDecl, ActionScope, InitializeParams, InitializeResult, ProviderInfo,
 };
 use hhh_im_protocol::platform::{
-    AccountCaps, ActionRules, AvatarShape, Capabilities, ConversationCaps, DiscoveryDesc, EventCaps,
-    HistoryMode, Limits, MessageCaps, OwnWithin, PeopleCaps, PlatformDesc, RateBudget,
+    AccountCaps, ActionRules, AvatarShape, Capabilities, ConversationCaps, DiscoveryDesc,
+    EventCaps, HistoryMode, Limits, MessageCaps, OwnWithin, PeopleCaps, PlatformDesc, RateBudget,
     ResourceCaps, SendCaps, SettingDecl,
 };
 use hhh_im_protocol::rpc::{ErrorKind, RpcError};
@@ -92,6 +92,9 @@ pub(crate) fn platform() -> PlatformDesc {
 /// 能力：做得到的都声明，做不到的（搜索、编辑、表情、定位私聊）不声明。
 pub(crate) fn capabilities() -> Capabilities {
     Capabilities {
+        conversation_groups: Default::default(),
+        rich_send: Default::default(),
+        stickers: Default::default(),
         conversations: ConversationCaps {
             list: true,
             search: false,
@@ -120,6 +123,7 @@ pub(crate) fn capabilities() -> Capabilities {
         edit: false,
         reactions: Default::default(),
         resources: ResourceCaps {
+            variants: true,
             read: true,
             avatars: true,
         },
@@ -249,7 +253,10 @@ mod tests {
         );
         assert_eq!(result["loginMethods"].as_array().unwrap().len(), 1);
         assert_eq!(result["capabilities"]["resources"]["avatars"], true);
-        assert_eq!(result["capabilities"]["account"]["hostAvatar"], true, "收宿主交来的头像");
+        assert_eq!(
+            result["capabilities"]["account"]["hostAvatar"], true,
+            "收宿主交来的头像"
+        );
         assert_eq!(result["capabilities"]["events"]["people"], true);
         let actions = actions();
         assert_eq!(actions.len(), 9);

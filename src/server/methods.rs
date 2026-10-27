@@ -312,6 +312,7 @@ impl Server {
                 }
             };
             items.push(ActivityItem {
+                first_page: None,
                 conversation: None,
                 conversation_id: item.conv.to_string(),
                 kind: conversation.kind,
