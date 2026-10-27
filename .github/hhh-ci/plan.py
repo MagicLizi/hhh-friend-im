@@ -12,6 +12,10 @@
   prepare        某个系统编译前先跑的命令，如 {"windows-x64": "python scripts/prepare-build-tools.py"}
   dropTargets    这次发布有意不再出的系统（不写时新版本的系统不能比上一个正式版本少）
 
+自己的机器：插件仓库的 Actions 变量 HHH_RUNNER_WINDOWS / HHH_RUNNER_MACOS 写自托管 runner 的标签时，Windows 版在
+带这个标签的 Windows 机器上编，Mac 版与 iPhone 版在 Mac 机器上编，没写用 GitHub 的机器；Linux 版总在 GitHub 的机器上编。
+公开仓库要先把外人 PR 设成每次都要批准（见 README）：外人 PR 能改本文件与工作流，挡住它的只有仓库设置，不是这里的代码。
+
 环境变量 HHH_RELEASE=true 表示这是一次发布（建草稿），否则只是检查。结果写进 GITHUB_OUTPUT。
 """
 import json
@@ -20,23 +24,38 @@ import re
 import sys
 from pathlib import Path
 
-# 系统 → (GitHub 机器, Rust 目标, 能不能在这台机器上直接运行, 清单 os 里要写的值, 程序扩展名)
+# 系统 → (GitHub 机器, Rust 目标, 能不能在这台机器上直接运行, 清单 os 里要写的值, 程序扩展名, 可以改在哪种自己的机器上编)
 TARGETS = {
-    "windows-x64": ("windows-latest", "x86_64-pc-windows-msvc", True, "windows", ".exe"),
-    "macos-arm64": ("macos-latest", "aarch64-apple-darwin", True, "macos", ""),
-    "macos-x64": ("macos-latest", "x86_64-apple-darwin", False, "macos", ""),
-    "linux-x64": ("ubuntu-latest", "x86_64-unknown-linux-gnu", True, "linux", ""),
-    "linux-arm64": ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", True, "linux", ""),
-    "wasm32-wasip2": ("ubuntu-latest", "wasm32-wasip2", False, "ios", ".wasm"),
+    "windows-x64": ("windows-latest", "x86_64-pc-windows-msvc", True, "windows", ".exe", "windows"),
+    "macos-arm64": ("macos-latest", "aarch64-apple-darwin", True, "macos", "", "macos"),
+    "macos-x64": ("macos-latest", "x86_64-apple-darwin", False, "macos", "", "macos"),
+    "linux-x64": ("ubuntu-latest", "x86_64-unknown-linux-gnu", True, "linux", "", None),
+    "linux-arm64": ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu", True, "linux", "", None),
+    "wasm32-wasip2": ("ubuntu-latest", "wasm32-wasip2", False, "ios", ".wasm", "macos"),
 }
 CONFIG = Path(".github/hhh-plugin.json")
 MANIFEST = Path("hhh-im-provider.json")
 KNOWN_KEYS = {"targets", "checkTargets", "cargoArgs", "binary", "lint", "selfCheckArgs", "prepare", "dropTargets"}
+# 自己的机器 → 指定它的 Actions 变量（值是自托管 runner 的标签）。
+SELF_HOSTED = {"windows": "HHH_RUNNER_WINDOWS", "macos": "HHH_RUNNER_MACOS"}
 
 
 def fail(message: str) -> None:
     print(f"::error::{message}")
     sys.exit(1)
+
+
+def runners() -> dict[str, list[str]]:
+    """设了变量的系统 → 自己机器的 runs-on。"""
+    chosen = {}
+    for os_name, variable in SELF_HOSTED.items():
+        label = os.environ.get(variable, "").strip()
+        if not label:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", label):
+            fail(f"Actions 变量 {variable} 要写成一个自托管 runner 标签（字母、数字、. _ -），现在是 {label!r}。")
+        chosen[os_name] = ["self-hosted", label]
+    return chosen
 
 
 def target_list(config: dict, key: str) -> list[str]:
@@ -94,12 +113,13 @@ def main() -> None:
     natives = [t for t in chosen if TARGETS[t][2]]
     lint_on = natives[0] if config.get("lint") and natives else None
     prepare = config.get("prepare", {})
+    own = runners()
     include = []
     for target in chosen:
-        runner, triple, native, _, ext = TARGETS[target]
+        runner, triple, native, _, ext, host = TARGETS[target]
         include.append({
             "target": target,
-            "runner": runner,
+            "runner": own.get(host, runner),
             "rust_target": triple,
             "native": native,
             "ext": ext,

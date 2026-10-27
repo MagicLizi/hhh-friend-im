@@ -36,7 +36,8 @@ env:
 jobs:
   plan:
     name: 读配置
-    runs-on: ubuntu-latest
+    # 读配置、合包、建草稿：设了 Mac 机器（Actions 变量 HHH_RUNNER_MACOS）就在它上面跑，没设用 GitHub 的 Linux 机器。
+    runs-on: ${{ vars.HHH_RUNNER_MACOS && fromJSON(format('["self-hosted","{0}"]', vars.HHH_RUNNER_MACOS)) || 'ubuntu-latest' }}
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       targets: ${{ steps.plan.outputs.targets }}
@@ -54,6 +55,8 @@ jobs:
         run: python3 .github/hhh-ci/plan.py
         env:
           HHH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.request != '' }}
+          HHH_RUNNER_WINDOWS: ${{ vars.HHH_RUNNER_WINDOWS }}
+          HHH_RUNNER_MACOS: ${{ vars.HHH_RUNNER_MACOS }}
       - name: 发布前先查（版本、更新说明）
         if: steps.plan.outputs.release == 'true'
         run: bash .github/hhh-ci/precheck.sh
@@ -88,10 +91,7 @@ jobs:
 
       - name: 装 wasi-sdk
         if: matrix.target == 'wasm32-wasip2'
-        run: |
-          name="wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux"
-          curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/${name}.tar.gz" | tar -xz -C "$RUNNER_TEMP"
-          echo "WASI_SDK_PATH=$RUNNER_TEMP/$name" >> "$GITHUB_ENV"
+        run: bash .github/hhh-ci/wasi-sdk.sh
 
       - name: 缓存自检工具
         if: matrix.native
@@ -148,7 +148,7 @@ jobs:
   assemble:
     name: 合包与核对
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HHH_RUNNER_MACOS && fromJSON(format('["self-hosted","{0}"]', vars.HHH_RUNNER_MACOS)) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -187,7 +187,7 @@ jobs:
     name: 建草稿 Release
     if: needs.plan.outputs.release == 'true'
     needs: [plan, assemble]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.HHH_RUNNER_MACOS && fromJSON(format('["self-hosted","{0}"]', vars.HHH_RUNNER_MACOS)) || 'ubuntu-latest' }}
     permissions:
       contents: write
     steps:
