@@ -82,3 +82,7 @@ WASI_SDK_PATH=<wasi-sdk 目录> scripts/pack-ios.sh   # 出 dist/friend-im-<版�
 同一份加密附件解密后的实际字节同时用于图片显示和原件保存，只声明一个版本供宿主共用缓存。
 
 新宿主经 `resources/describe` 选择实际版本，读取时带 `variant`；省略 `variant` 的旧调用仍按原来的方式读取；二进制安装仍需通过宿主的最低 SDK 检查。分段缓存包含实际版本，不把预览当成原件。本版固定使用 IM SDK v0.15.0，宿主需支持该版 SDK。
+
+## 合并转发记录
+
+当前 Cindy IM 服务端消息只包含文字、提及、图片与文件，没有原生合并转发内容。因此 `capabilities.messages.forwarded` 保持默认关闭，不提供虚假的聊天记录入口。本次没有新增发送功能或修改服务端消息协议。
