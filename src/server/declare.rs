@@ -236,6 +236,10 @@ mod tests {
     fn declaration_is_consistent() {
         let result = serde_json::to_value(result()).unwrap();
         assert_eq!(result["provider"]["id"], PROVIDER_ID);
+        assert_ne!(
+            result["capabilities"]["messages"]["forwarded"], true,
+            "当前加密消息格式没有转发快照，不声明尚未实现的能力"
+        );
         assert_eq!(result["platform"]["history"], "server");
         assert_eq!(result["platform"]["pageMax"], 100);
         assert_eq!(
