@@ -3,7 +3,7 @@
   "id": "friend-im",
   "name": "Cindy IM",
   "imType": "friend-im",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "command": "friend-im",
   "os": ["windows", "macos", "linux", "ios"],
   "logo": "logo.svg",
