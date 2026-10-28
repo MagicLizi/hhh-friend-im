@@ -156,8 +156,16 @@ fn mime_of(name: &str, image: bool, head: &[u8]) -> String {
         "txt" | "md" | "log" => "text/plain",
         "zip" => "application/zip",
         "mp4" => "video/mp4",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
+        "mp3" | "mp2" => "audio/mpeg",
+        "wav" | "wave" => "audio/wav",
+        "m4a" | "m4b" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
+        "amr" => "audio/amr",
+        "awb" => "audio/amr-wb",
+        "aif" | "aiff" => "audio/aiff",
+        "wma" => "audio/x-ms-wma",
         _ => "application/octet-stream",
     }
     .into()
@@ -855,6 +863,14 @@ mod tests {
         ];
         assert_eq!(mime_of("x.bin", true, &png), "image/png");
         assert_eq!(mime_of("报告.PDF", false, &[]), "application/pdf");
+        for (name, mime) in [
+            ("讨论.M4A", "audio/mp4"),
+            ("音乐.FLAC", "audio/flac"),
+            ("录音.OPUS", "audio/ogg"),
+            ("旧语音.amr", "audio/amr"),
+        ] {
+            assert_eq!(mime_of(name, false, &[]), mime);
+        }
         assert_eq!(mime_of("无后缀", false, &[]), "application/octet-stream");
     }
 }
