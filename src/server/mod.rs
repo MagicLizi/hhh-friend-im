@@ -11,6 +11,7 @@
 
 mod actions;
 mod approvals;
+mod contacts;
 mod declare;
 mod errors;
 mod flow;
@@ -284,6 +285,10 @@ impl Server {
             },
             Method::ActionsStart => match params(value) {
                 Ok(p) => return self.actions_start(id, p).await,
+                Err(error) => Err(error),
+            },
+            Method::ContactsList => match params(value) {
+                Ok(p) => self.contacts_list(p).await,
                 Err(error) => Err(error),
             },
             Method::ConversationsList => match params(value) {

@@ -13,6 +13,7 @@
 - 换一台电脑：在已登录的电脑上批准它（输入新电脑上显示的 4 个词），或输入恢复密钥；批准后能看到全部历史。新电脑上会写明该去哪台批准；
   其它电脑都不在线时先列出它们和多久前在线，恢复密钥放在最前面。
 - 会话列表右上角“＋”可以加好友、新建群、查看我的好友链接（新版 Friend）；设置 → IM → 管理仍保留这些操作。
+- 支持好友目录的宿主会把已有好友直接恢复到会话列表，即使没有近期聊天；恢复只取好友资料，消息发现仍只回看最近 24 小时。此能力需要含 `people.contacts` / `contacts/list` 的新 SDK 与宿主；当前任务依赖本地 SDK 联调，正式标签升级与发布另行处理。
 - 加好友用好友链接（链接里带着身份指纹，加好友的同时就核对了是本人）；能建群、邀请人、移出成员。
 - 不想看的会话在侧栏右键“删除会话”：只从列表里拿掉，聊天记录还在；这个会话有新消息时会再出现。
 - 名字沿用 Cindy；头像用你在 HHH 里的头像（没上传时是画着你名字的默认头像），换头像或改名后好友那边跟着更新（0.4.0 起，需要新版 HHH）。
@@ -57,7 +58,7 @@ cargo test --workspace   # 插件、共用部分与客户端库（含锁住线�
 打包插件：
 
 ```sh
-cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.14.0 hhh-im-protocol --features transport,package
+cargo install --git https://github.com/MagicLizi/hhh-im-sdk --tag v0.15.0 hhh-im-protocol --features transport,package
 powershell -File scripts/pack.ps1     # Windows（官方版本加 -SignKey <hhh-keys>/official/hhh-official-signing.key）
 scripts/pack.sh                       # macOS / Linux
 hhh-im-check dist/stage/hhh-im-provider.json
@@ -80,4 +81,4 @@ WASI_SDK_PATH=<wasi-sdk 目录> scripts/pack-ios.sh   # 出 dist/friend-im-<版�
 
 同一份加密附件解密后的实际字节同时用于图片显示和原件保存，只声明一个版本供宿主共用缓存。
 
-新宿主经 `resources/describe` 选择实际版本，读取时带 `variant`；省略 `variant` 的旧调用仍按原来的方式读取；二进制安装仍需通过宿主的最低 SDK 检查。分段缓存包含实际版本，不把预览当成原件。本版固定使用 IM SDK v0.14.0，宿主需支持该版 SDK。
+新宿主经 `resources/describe` 选择实际版本，读取时带 `variant`；省略 `variant` 的旧调用仍按原来的方式读取；二进制安装仍需通过宿主的最低 SDK 检查。分段缓存包含实际版本，不把预览当成原件。本版固定使用 IM SDK v0.15.0，宿主需支持该版 SDK。

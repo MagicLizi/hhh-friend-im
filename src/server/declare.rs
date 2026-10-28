@@ -92,7 +92,6 @@ pub(crate) fn platform() -> PlatformDesc {
 /// 能力：做得到的都声明，做不到的（搜索、编辑、表情、定位私聊）不声明。
 pub(crate) fn capabilities() -> Capabilities {
     Capabilities {
-        conversation_groups: Default::default(),
         rich_send: Default::default(),
         stickers: Default::default(),
         conversations: ConversationCaps {
@@ -107,6 +106,7 @@ pub(crate) fn capabilities() -> Capabilities {
             get: false,
         },
         people: PeopleCaps {
+            contacts: true,
             get: true,
             search: false,
             ..Default::default()
