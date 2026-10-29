@@ -2,7 +2,7 @@
 use crate::{Client, ClientError, Message, Result, conn::Conn, state::State};
 use friend_im_core::{
     bytes::Fixed,
-    ids::{ConvId, MsgId, Uid},
+    ids::{ConvId, DeviceId, MsgId, Uid},
     message::{Content, Sender},
     reading::{ReadingBody, ReadingEnvelope, StoredReading},
     wire::{ErrorCode, Request, Response, WireError},
@@ -35,6 +35,19 @@ fn unsupported() -> ClientError {
         code: ErrorCode::Unsupported,
         message: "当前服务器尚未提供阅读扩展，聊天仍可使用".into(),
     })
+}
+
+/// 服务端按会话、账号和设备保存 CAS 版本。重置身份保留设备钥匙时，
+/// 旧身份的阅读边界不能继承，但同一行的版本必须继续递增。
+fn next_revision(records: &[Verified], uid: &Uid, device: &DeviceId) -> Result<u64> {
+    records
+        .iter()
+        .filter(|r| &r.record.envelope.reader == uid && &r.record.envelope.device == device)
+        .map(|r| r.record.envelope.revision)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| ClientError::state("阅读版本已到上限"))
 }
 
 impl State {
@@ -265,14 +278,7 @@ impl State {
         if own.iter().any(|r| r.body.through >= message.log) {
             return Ok(ReadingMark::Applied);
         }
-        let revision = own
-            .iter()
-            .filter(|r| r.record.envelope.device == self.creds.device.id())
-            .map(|r| r.record.envelope.revision)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| ClientError::state("阅读版本已到上限"))?;
+        let revision = next_revision(&records, &self.uid, &self.creds.device.id())?;
         let generation = self.book.convs[conv].state.current_key().generation;
         let seed = self.conv_seed(conn, conv, generation).await?;
         let envelope = ReadingEnvelope::seal(
@@ -334,5 +340,59 @@ impl Client {
     pub async fn reading_messages(&self, conv: &ConvId, ids: &[MsgId]) -> Result<Vec<Message>> {
         self.call(async |s, c| s.reading_messages(c, conv, ids).await)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use friend_im_core::keys::{ConvSeed, DeviceSecret};
+
+    fn record(
+        conv: &ConvId,
+        uid: &Uid,
+        device: &DeviceSecret,
+        eldest: u8,
+        revision: u64,
+    ) -> Verified {
+        let body = ReadingBody {
+            through: 1,
+            message: MsgId::random(),
+        };
+        let envelope = ReadingEnvelope::seal(
+            conv,
+            1,
+            revision,
+            &ConvSeed::generate(),
+            &Sender {
+                uid,
+                eldest: Fixed([eldest; 32]),
+                device,
+            },
+            &body,
+        )
+        .unwrap();
+        Verified {
+            record: StoredReading { log: 2, envelope },
+            body,
+        }
+    }
+
+    #[test]
+    fn same_device_keeps_its_revision_after_identity_reset() {
+        let conv = ConvId::random();
+        let me = Uid::random();
+        let other = Uid::random();
+        let device = DeviceSecret::generate();
+        let other_device = DeviceSecret::generate();
+        // 本设备仍只有旧身份记录；新身份在另一设备的版本和别人的版本
+        // 都不属于本设备的 CAS 行，不能替代或重置旧版本 5。
+        let records = vec![
+            record(&conv, &me, &device, 1, 5),
+            record(&conv, &me, &other_device, 2, 90),
+            record(&conv, &other, &device, 2, 70),
+        ];
+        assert_eq!(next_revision(&records, &me, &device.id()).unwrap(), 6);
+        assert_eq!(next_revision(&[], &me, &device.id()).unwrap(), 1);
     }
 }
