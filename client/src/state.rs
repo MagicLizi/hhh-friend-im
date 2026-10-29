@@ -175,8 +175,15 @@ impl State {
 
     /// 某会话某一代的钥匙：缓存里没有就向服务器取封装给我的、解开并核对。
     pub async fn conv_seed(&mut self, conn: &Conn, conv: &ConvId, generation: u32) -> Result<ConvSeed> {
+        self.optional_conv_seed(conn, conv, generation)
+            .await?
+            .ok_or_else(|| ClientError::verify(format!("拿不到第 {generation} 代会话钥匙")))
+    }
+
+    /// 旧身份或入群前的钥匙可以不存在；验签、解封或协议错误仍然向上传递。
+    pub async fn optional_conv_seed(&mut self, conn: &Conn, conv: &ConvId, generation: u32) -> Result<Option<ConvSeed>> {
         if let Some(seed) = self.keys.conv_seed(conv, generation) {
-            return Ok(seed);
+            return Ok(Some(seed));
         }
         if self.book.conv(conn, conv).await?.state.key(generation).is_none() {
             self.book.load_conv(conn, conv).await?;
@@ -197,9 +204,7 @@ impl State {
             self.load_account_keys(conn).await?;
         }
         self.keys.open_conv_keys(&self.uid, &state, &boxes, &prev)?;
-        self.keys
-            .conv_seed(conv, generation)
-            .ok_or_else(|| ClientError::verify(format!("拿不到第 {generation} 代会话钥匙")))
+        Ok(self.keys.conv_seed(conv, generation))
     }
 
     /// 把账号钥匙某一代封装给一台电脑（或恢复密钥）。
