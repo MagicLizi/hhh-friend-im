@@ -1,8 +1,8 @@
 //! 插件操作（provider-protocol v13 §6.7；契约 S5、S6、S8、S9、S11–S13、S17；文字照原型 friend-im-v2）。
 //!
 //! - 账号级：我的电脑（移除别的电脑、重新生成恢复密钥）、我的好友链接（换一条）、加好友（也收群邀请链接）、新建群、
-//!   关于加密。会话级（只给群）：群成员（群主能移出）、邀请成员（勾选好友或给群邀请链接）、退出群；私聊、群都有的：
-//!   删除会话（只从宿主的列表里拿掉，HHH 契约 provider-protocol v18 §4）。
+//!   关于加密。会话级（只给群）：群成员（群主能移出）、邀请成员（勾选好友或给群邀请链接）、退出群。把会话从列表拿掉
+//!   是宿主会话菜单里所有 IM 通用的“从列表移除”（HHH 契约 friend/sidebar-sessions v25），插件不再有自己的“删除会话”。
 //! - 提醒上的“查看”：`approve:<请求>` 是批准新电脑（[`super::approvals`]），`devices` 打开我的电脑。
 //! - 每项操作是一个流程（[`super::flow`]）：先回流程编号再推第一步；子步骤的“取消”用 `cancelChoice: "back"` 回到上一层，
 //!   点遮罩、按 Esc 关掉整个对话框（宿主发 `action/cancel`，这里不再推结果）。
@@ -40,8 +40,6 @@ pub(crate) const MEMBERS: &str = "members";
 pub(crate) const INVITE: &str = "invite";
 /// 退出群。
 pub(crate) const LEAVE: &str = "leave";
-/// 删除会话（私聊、群都有）。
-pub(crate) const DELETE: &str = "delete-conversation";
 
 /// 群名至多几个字。
 const GROUP_NAME_MAX_CHARS: usize = 64;
@@ -58,7 +56,6 @@ enum Which {
     Members(ConvId),
     Invite(ConvId),
     Leave(ConvId),
-    Delete(ConvId),
     Approve(String),
 }
 
@@ -231,7 +228,7 @@ impl Server {
         if let Some(which) = account {
             return Ok(which);
         }
-        if ![MEMBERS, INVITE, LEAVE, DELETE].contains(&id) {
+        if ![MEMBERS, INVITE, LEAVE].contains(&id) {
             return Err(errors::of(
                 ErrorKind::Unsupported,
                 "Cindy IM 没有这项操作。",
@@ -243,10 +240,6 @@ impl Server {
             .ok_or_else(|| errors::of(ErrorKind::InvalidRequest, "这项操作要在会话里用。"))?;
         let conv =
             ConvId::parse(text).map_err(|_| errors::of(ErrorKind::NotFound, "没有这个会话。"))?;
-        // 删除会话私聊、群都有，退了的群也能删；不问服务器（连不上时也能清理列表）。
-        if id == DELETE {
-            return Ok(Which::Delete(conv));
-        }
         let info = live
             .client
             .conv_info(&conv)
@@ -288,7 +281,6 @@ impl Server {
             Which::Members(conv) => self.members(&live, &ui, &mut rx, &conv).await,
             Which::Invite(conv) => self.invite(&live, &ui, &mut rx, &conv).await,
             Which::Leave(conv) => self.leave(&live, &ui, &mut rx, &conv).await,
-            Which::Delete(conv) => delete(&live, &ui, &mut rx, &conv).await,
         }
     }
 
@@ -976,37 +968,6 @@ impl Server {
     }
 }
 
-/// 删除会话的确认：可撤销，不用危险色。会话名读不到时不写名字。
-fn delete_step(name: Option<&str>) -> Value {
-    let caption = name.map_or_else(
-        || "删除这个会话？".to_owned(),
-        |name| format!("删除「{name}」？"),
-    );
-    json!({ "kind": "confirm", "caption": caption, "confirmLabel": "删除",
-        "text": "只从你的列表里拿掉，聊天记录还在；有新消息时会再出现。" })
-}
-
-/// 删除会话（HHH 契约 provider-protocol v18 §4）：私聊、群都有。确认后不动服务器、不删本机记录，只请宿主把它从列表里
-/// 拿掉（对话框直接关掉）；这个会话以后有新消息（包括系统提示）时照样回到列表。取消就什么都不做。
-async fn delete(live: &Live, ui: &Ui<'_>, rx: &mut mpsc::UnboundedReceiver<Input>, conv: &ConvId) {
-    let name = live
-        .conversation(conv)
-        .await
-        .map(|c| c.name)
-        .ok()
-        .filter(|name| !name.trim().is_empty());
-    ui.step(delete_step(name.as_deref()));
-    loop {
-        match next(rx).await {
-            None => return,
-            Some(Input::Choose { choice, .. }) if choice == "confirm" => break,
-            Some(_) => {}
-        }
-    }
-    tracing::info!(%conv, "删除会话：请宿主从列表里拿掉");
-    ui.done_removing_from_list();
-}
-
 /// 关于加密（S17）：服务器看得到什么、看不到什么（第一阶段核对过的实际情况），只有“知道了”。
 async fn about(ui: &Ui<'_>, rx: &mut mpsc::UnboundedReceiver<Input>) {
     ui.step(json!({
@@ -1100,41 +1061,5 @@ mod tests {
                 serde_json::from_value(step.clone()).unwrap_or_else(|e| panic!("{e}: {step}"));
             assert_eq!(step_problem(&parsed), None, "{step}");
         }
-    }
-
-    // 删除会话（HHH 契约 provider-protocol v18 §4）：确认一步照协议、不用危险色，读不到会话名时不写名字；确认后只以
-    // `removeFromList` 结束，不给标题与说明（宿主直接关掉对话框）。
-    #[test]
-    fn deleting_a_conversation_only_asks_the_host_to_take_it_off_the_list() {
-        for step in [delete_step(Some("周末徒步")), delete_step(None)] {
-            let parsed: LoginStep =
-                serde_json::from_value(step.clone()).unwrap_or_else(|e| panic!("{e}: {step}"));
-            assert_eq!(step_problem(&parsed), None, "{step}");
-            assert!(step.get("danger").is_none(), "可撤销，不用危险色：{step}");
-            assert_eq!(step["confirmLabel"], "删除");
-            assert_eq!(
-                step["text"],
-                "只从你的列表里拿掉，聊天记录还在；有新消息时会再出现。"
-            );
-        }
-        assert_eq!(
-            delete_step(Some("周末徒步"))["caption"],
-            "删除「周末徒步」？"
-        );
-        assert_eq!(delete_step(None)["caption"], "删除这个会话？");
-
-        let (peer, mut writes) = super::super::peer::Peer::new();
-        let ui = Ui {
-            peer: &peer,
-            flow_id: "f1".into(),
-            kind: Kind::Action,
-        };
-        ui.done_removing_from_list();
-        let sent = writes.try_recv().unwrap();
-        assert_eq!(sent.method.as_deref(), Some("action/finished"));
-        assert_eq!(
-            sent.params,
-            Some(json!({ "flowId": "f1", "removeFromList": true }))
-        );
     }
 }
