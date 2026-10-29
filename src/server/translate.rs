@@ -112,6 +112,7 @@ fn block(part: &Part, names: &Names) -> Block {
 
 fn resource(file: &FileRef, kind: ResourceKind) -> Resource {
     Resource {
+        voice: false,
         key: resource_key(file),
         kind,
         mime: (!file.mime.is_empty()).then(|| file.mime.clone()),
@@ -123,6 +124,7 @@ fn resource(file: &FileRef, kind: ResourceKind) -> Resource {
 
 fn wire(id: String, conv: String, sender: Sender, created_at_ms: i64, content: Vec<Block>) -> Wire {
     Wire {
+        read_position: None,
         id,
         conversation_id: conv,
         sender,
@@ -162,7 +164,7 @@ fn system() -> Sender {
 /// 一条解开的消息 → 协议的消息。撤回动作本身（`Content::Recall`）与个人资料（`Content::Profile`）不是给人看的消息，
 /// 为 `None`：被撤回的那条由 [`recalled`] 另外报，个人资料只记下头像。时间用服务器收到的时间（和按时间读历史同一把尺子）。
 pub(crate) fn message(m: &Message, names: &Names) -> Option<Wire> {
-    match &m.content {
+    let mut wire = match &m.content {
         None => Some(recalled(m.conv.as_str(), &m.id, &m.sender, m.ts_ms, names)),
         Some(Content::Recall { .. } | Content::Profile { .. }) => None,
         Some(Content::Post { parts, reply_to }) => Some(posted(
@@ -174,7 +176,9 @@ pub(crate) fn message(m: &Message, names: &Names) -> Option<Wire> {
             reply_to.as_ref(),
             names,
         )),
-    }
+    }?;
+    wire.read_position = Some(m.log.to_string());
+    Some(wire)
 }
 
 /// 一条普通消息（收到的，或刚发出去的）。

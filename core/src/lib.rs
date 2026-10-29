@@ -14,6 +14,7 @@ pub mod keys;
 pub mod limits;
 pub mod message;
 pub mod pake;
+pub mod reading;
 pub mod wire;
 pub mod words;
 

@@ -253,6 +253,7 @@ impl Server {
     }
 
     /// 新电脑：等旧电脑批准，或改用恢复密钥，或重置。`name` 是这台电脑的名字。
+    #[allow(clippy::too_many_arguments)] // 同一登录流程的输入与凭据回调保持原有边界。
     async fn join(
         &self,
         ui: &Ui<'_>,

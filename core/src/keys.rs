@@ -299,6 +299,11 @@ impl ConvSeed {
         crypto::derive::<32>(&self.0, ctx::KDF_CONV_PROFILE)
     }
 
+    /// 阅读状态使用独立派生钥匙，不复用消息或群资料的密钥空间。
+    pub fn reading_key(&self) -> Zeroizing<[u8; 32]> {
+        crypto::derive::<32>(&self.0, ctx::KDF_CONV_READING)
+    }
+
     /// 旧钥匙链：用这一代加密上一代种子。新成员只拿到当前一代，就能倒推出以前全部的代，看到全部历史。
     pub fn wrap_previous(&self, conv: &ConvId, generation: u32, previous: &ConvSeed) -> Bytes {
         let key = crypto::derive::<32>(&self.0, ctx::KDF_CONV_PREV);

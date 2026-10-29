@@ -43,6 +43,7 @@ mod lan;
 mod links;
 mod ops_account;
 mod ops_conv;
+mod reading;
 mod state;
 mod types;
 #[cfg(target_os = "wasi")]
@@ -59,6 +60,7 @@ pub mod web;
 pub use client::{Client, Updates};
 pub use error::{ClientError, Result};
 pub use links::{FriendLink, InviteLink};
+pub use reading::{MessageReceipt, ReadingMark};
 pub use types::{AccountNotice, Config, ConvInfo, ConvNotice, Credentials, HistoryItem, HistoryPage, JoinStart, Message, Notice, Update};
 
 /// 两边共用的格式（编号、消息内容、群资料等），原样转出，插件不用另外依赖。
