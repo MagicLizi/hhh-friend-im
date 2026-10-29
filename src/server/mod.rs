@@ -296,6 +296,10 @@ impl Server {
                 Ok(p) => return self.actions_start(id, p).await,
                 Err(error) => Err(error),
             },
+            Method::ContactsProfile | Method::ContactsAdd => match params(value) {
+                Ok(p) => self.contact_profile(p, known == Method::ContactsAdd).await,
+                Err(error) => Err(error),
+            },
             Method::ContactsList => match params(value) {
                 Ok(p) => self.contacts_list(p).await,
                 Err(error) => Err(error),

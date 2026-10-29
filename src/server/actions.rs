@@ -7,7 +7,6 @@
 //! - 每项操作是一个流程（[`super::flow`]）：先回流程编号再推第一步；子步骤的“取消”用 `cancelChoice: "back"` 回到上一层，
 //!   点遮罩、按 Esc 关掉整个对话框（宿主发 `action/cancel`，这里不再推结果）。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use friend_im_client::core::conv::{ConvKind, GroupProfile, Via};
@@ -699,6 +698,105 @@ impl Server {
         }
     }
 
+    /// The member-list entry has the same explicit-add semantics as message avatars.
+    async fn member_card(
+        &self,
+        live: &Live,
+        ui: &Ui<'_>,
+        rx: &mut mpsc::UnboundedReceiver<Input>,
+        conv: &ConvId,
+        person: (&Uid, &str),
+        group: &str,
+    ) -> bool {
+        use hhh_im_protocol::contacts::{ContactProfile, ContactRelationship, ContactTarget};
+        let (user, name) = person;
+        let target = ContactTarget {
+            conversation_id: conv.to_string(),
+            user_id: user.to_string(),
+        };
+        let mut add = false;
+        let mut tip = None;
+        loop {
+            ui.step(waiting(if add {
+                "正在添加好友…"
+            } else {
+                "正在确认好友关系…"
+            }));
+            if !self.live().await.is_ok_and(|current| current.me == live.me) {
+                ui.fail(Some("账号已切换"), "请重新打开成员名片。", None);
+                return true;
+            }
+            let result = self.contact_profile(target.clone(), add).await;
+            add = false;
+            let profile: Option<ContactProfile> = match result {
+                Ok(value) => serde_json::from_value(value).ok(),
+                Err(error) => {
+                    tip = Some(note(&error.message, true));
+                    None
+                }
+            };
+            let mut actions = Vec::new();
+            let detail = match profile.as_ref().map(|p| p.relationship) {
+                Some(ContactRelationship::SelfAccount) => "这是你自己",
+                Some(ContactRelationship::Contact) => {
+                    actions.push(json!({"id":"message","label":"发消息"}));
+                    "你的好友"
+                }
+                Some(ContactRelationship::NotContact) => {
+                    if profile.as_ref().is_some_and(|p| p.can_add) {
+                        actions.push(json!({"id":"add","label":"添加好友"}));
+                    }
+                    "还不是好友"
+                }
+                None => {
+                    actions.push(json!({"id":"retry","label":"重新查询"}));
+                    "好友关系暂时无法确认"
+                }
+            };
+            actions.push(json!({"id":"back","label":"返回群成员"}));
+            ui.step(compact(json!({"kind":"list", "caption":format!("来自群聊 · {group}"),
+                "rows":[person_row(user.as_str(),name,Some(detail),None,actions)], "note":tip.take()})));
+            match next(rx).await {
+                Some(Input::Choose {
+                    choice,
+                    row: Some(row),
+                    ..
+                }) if row == user.as_str() => match choice.as_str() {
+                    "back" => return false,
+                    "retry" => continue,
+                    "add" if profile.as_ref().is_some_and(|p| p.can_add) => {
+                        add = true;
+                    }
+                    "message"
+                        if profile
+                            .as_ref()
+                            .is_some_and(|p| p.relationship == ContactRelationship::Contact) =>
+                    {
+                        // Recheck membership and relationship after the user chooses to open.
+                        match self.contact_profile(target.clone(), false).await {
+                            Ok(value) => {
+                                if let Ok(current) = serde_json::from_value::<ContactProfile>(value)
+                                    && let Some(id) = current
+                                        .conversation_id
+                                        .and_then(|id| ConvId::parse(&id).ok())
+                                {
+                                    ui.done_opening(&id, None, None);
+                                    return true;
+                                }
+                            }
+                            Err(error) => {
+                                tip = Some(note(&error.message, true));
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                None => return true,
+                _ => {}
+            }
+        }
+    }
+
     /// 群成员（S13）：群主能移出别人。
     async fn members(
         &self,
@@ -707,11 +805,6 @@ impl Server {
         rx: &mut mpsc::UnboundedReceiver<Input>,
         conv: &ConvId,
     ) {
-        let details: HashMap<Uid, &'static str> = self
-            .friends(live)
-            .await
-            .map(|f| f.into_iter().map(|f| (f.uid, f.detail)).collect())
-            .unwrap_or_default();
         let mut tip: Option<(String, bool)> = None;
         loop {
             let info = match live.client.conv_info(conv).await {
@@ -749,16 +842,10 @@ impl Server {
                 .take(ROWS_MAX)
                 .map(|m| {
                     let me = m.uid == live.me;
-                    let detail = if me {
-                        Some("你自己")
-                    } else {
-                        details.get(&m.uid).copied()
-                    };
-                    // 别人那一行都能“发消息”（S10，不用先加好友）；群主还能移出。
+                    let detail = if me { Some("你自己") } else { None };
+                    // 名片只查询关系；添加好友由名片里的明确操作触发。
                     let mut actions = Vec::new();
-                    if !me {
-                        actions.push(json!({ "id": "message", "label": "发消息" }));
-                    }
+                    actions.push(json!({ "id": "profile", "label": "查看名片" }));
                     if mine && !me {
                         actions.push(json!({ "id": "remove", "label": "移出", "danger": true }));
                     }
@@ -780,33 +867,21 @@ impl Server {
                     choice,
                     row: Some(row),
                     ..
-                }) if choice == "message" => {
+                }) if choice == "profile" => {
                     let Some(target) = info
                         .members
                         .iter()
-                        .find(|m| m.uid.as_str() == row && m.uid != live.me)
+                        .find(|m| m.uid.as_str() == row)
                         .map(|m| m.uid.clone())
                     else {
                         continue;
                     };
-                    let who = name_of(&target);
-                    ui.step(waiting("正在打开私聊…"));
-                    match live.client.open_dm(&target, conv).await {
-                        // 新建的私聊随推送进会话列表；已经有的照旧在那里。
-                        Ok(_) => ui.done(
-                            Some(&format!("和「{who}」私聊")),
-                            Some("私聊在你的会话列表里，点开就能聊，不用先加好友。"),
-                        ),
-                        Err(error) => {
-                            tracing::info!(%conv, %error, "和群成员私聊没成");
-                            tip = Some((
-                                format!("没能打开和「{who}」的私聊：{}", said(&error)),
-                                true,
-                            ));
-                            continue;
-                        }
+                    if self
+                        .member_card(live, ui, rx, conv, (&target, &name_of(&target)), &group)
+                        .await
+                    {
+                        return;
                     }
-                    return;
                 }
                 Some(Input::Choose {
                     choice,

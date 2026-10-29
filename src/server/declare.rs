@@ -131,6 +131,7 @@ pub(crate) fn capabilities() -> Capabilities {
             get: false,
         },
         people: PeopleCaps {
+            contact_actions: true,
             contacts: true,
             get: true,
             search: false,

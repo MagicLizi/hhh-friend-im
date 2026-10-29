@@ -142,7 +142,14 @@ impl State {
 
     /// 和群里的某个成员私聊（契约 S10）：身份以群里邀请人的签名为准。
     pub async fn open_dm(&mut self, conn: &Conn, uid: &Uid, group: &ConvId) -> Result<ConvId> {
+        self.book.load_conv(conn, group).await?;
         let record = self.book.conv(conn, group).await?;
+        if uid == &self.uid
+            || record.state.kind != ConvKind::Group
+            || !record.state.members.contains_key(&self.uid)
+        {
+            return Err(ClientError::state("只能添加同群的其他成员为好友"));
+        }
         let eldest = record.state.members.get(uid).map(|m| m.eldest).ok_or_else(|| ClientError::state("对方不在这个群里"))?;
         let me = self.my_ref(conn).await?;
         let them = MemberRef { uid: uid.clone(), eldest };
