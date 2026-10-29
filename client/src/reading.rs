@@ -26,7 +26,8 @@ pub enum ReadingMark {
 
 struct Verified {
     record: StoredReading,
-    body: ReadingBody,
+    // 重置后旧私钥已经丢弃。签名头仍可用于 CAS，旧密文不能当成阅读事实。
+    body: Option<ReadingBody>,
 }
 const RECORDS_MAX: usize = 20_000;
 
@@ -93,9 +94,16 @@ impl State {
         Ok(result)
     }
 
-    async fn reading_records(&mut self, conn: &Conn, conv: &ConvId) -> Result<Vec<Verified>> {
+    async fn reading_records(
+        &mut self,
+        conn: &Conn,
+        conv: &ConvId,
+        own_only: bool,
+    ) -> Result<Vec<Verified>> {
         self.require_reading()?;
         self.book.load_conv(conn, conv).await?;
+        let me = self.my_ref(conn).await?;
+        let generation = self.book.convs[conv].state.current_key().generation;
         let mut after = 0;
         let mut records = Vec::new();
         loop {
@@ -135,6 +143,9 @@ impl State {
         let mut result = Vec::with_capacity(records.len());
         for record in records {
             let envelope = &record.envelope;
+            if own_only && envelope.reader != self.uid {
+                continue;
+            }
             if !self.book.convs[conv].member_at(
                 &envelope.reader,
                 &envelope.reader_eldest,
@@ -152,9 +163,21 @@ impl State {
                     record.log,
                 )
                 .await?;
-            let seed = self.conv_seed(conn, conv, envelope.generation).await?;
-            let body = envelope.open(&seed, &device)?;
-            if body.through >= record.log {
+            envelope.verify(&device)?;
+            let body = if envelope.reader == self.uid && envelope.reader_eldest != me.eldest {
+                None
+            } else if let Some(seed) = self
+                .optional_conv_seed(conn, conv, envelope.generation)
+                .await?
+            {
+                Some(envelope.open(&seed, &device)?)
+            } else if envelope.generation < generation {
+                // 不把拿不到旧钥匙误报成未读，也不让旧记录阻断新身份的同步。
+                None
+            } else {
+                return Err(ClientError::verify("拿不到当前阅读记录的会话钥匙"));
+            };
+            if body.as_ref().is_some_and(|b| b.through >= record.log) {
                 return Err(ClientError::verify("阅读记录早于它声称读到的消息"));
             }
             result.push(Verified { record, body });
@@ -162,7 +185,7 @@ impl State {
         // 水位必须能对应回同一会话里真实存在、验签通过的确切消息。
         let ids: Vec<_> = result
             .iter()
-            .map(|v| v.body.message.clone())
+            .filter_map(|v| v.body.as_ref().map(|b| b.message.clone()))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -174,7 +197,8 @@ impl State {
         }
         if result
             .iter()
-            .any(|v| boundaries.get(&v.body.message) != Some(&v.body.through))
+            .filter_map(|v| v.body.as_ref())
+            .any(|b| boundaries.get(&b.message) != Some(&b.through))
         {
             return Err(ClientError::verify("阅读水位与确切消息对不上"));
         }
@@ -182,14 +206,14 @@ impl State {
     }
 
     async fn reading_through(&mut self, conn: &Conn, conv: &ConvId) -> Result<Option<u64>> {
-        let records = self.reading_records(conn, conv).await?;
+        let records = self.reading_records(conn, conv, true).await?;
         let me = self.my_ref(conn).await?;
         Ok(records
             .iter()
             .filter(|r| {
                 r.record.envelope.reader == self.uid && r.record.envelope.reader_eldest == me.eldest
             })
-            .map(|r| r.body.through)
+            .filter_map(|r| r.body.as_ref().map(|b| b.through))
             .max())
     }
 
@@ -199,17 +223,22 @@ impl State {
         conv: &ConvId,
         ids: &[MsgId],
     ) -> Result<Vec<MessageReceipt>> {
-        let records = self.reading_records(conn, conv).await?;
+        let records = self.reading_records(conn, conv, false).await?;
         let mut positions: HashMap<(Uid, Fixed<32>), u64> = HashMap::new();
+        let mut unknown = HashSet::new();
         for record in records {
             let key = (
                 record.record.envelope.reader,
                 record.record.envelope.reader_eldest,
             );
-            positions
-                .entry(key)
-                .and_modify(|p| *p = (*p).max(record.body.through))
-                .or_insert(record.body.through);
+            if let Some(body) = record.body {
+                positions
+                    .entry(key)
+                    .and_modify(|p| *p = (*p).max(body.through))
+                    .or_insert(body.through);
+            } else {
+                unknown.insert(key);
+            }
         }
         let messages = self.reading_messages(conn, conv, ids).await?;
         let mut result = Vec::new();
@@ -239,6 +268,7 @@ impl State {
             for (uid, eldest) in recipients {
                 match positions.get(&(uid.clone(), eldest)) {
                     Some(through) if *through >= message.log => receipt.readers.push(uid),
+                    _ if unknown.contains(&(uid.clone(), eldest)) => receipt.complete = false,
                     Some(_) => receipt.unreaders.push(uid),
                     None => receipt.complete = false,
                 }
@@ -267,7 +297,7 @@ impl State {
         {
             return Err(ClientError::state("阅读边界与消息不一致"));
         }
-        let records = self.reading_records(conn, conv).await?;
+        let records = self.reading_records(conn, conv, true).await?;
         let me = self.my_ref(conn).await?;
         let own: Vec<_> = records
             .iter()
@@ -275,7 +305,10 @@ impl State {
                 r.record.envelope.reader == self.uid && r.record.envelope.reader_eldest == me.eldest
             })
             .collect();
-        if own.iter().any(|r| r.body.through >= message.log) {
+        if own
+            .iter()
+            .any(|r| r.body.as_ref().is_some_and(|b| b.through >= message.log))
+        {
             return Ok(ReadingMark::Applied);
         }
         let revision = next_revision(&records, &self.uid, &self.creds.device.id())?;
@@ -374,7 +407,7 @@ mod tests {
         .unwrap();
         Verified {
             record: StoredReading { log: 2, envelope },
-            body,
+            body: Some(body),
         }
     }
 
@@ -387,11 +420,13 @@ mod tests {
         let other_device = DeviceSecret::generate();
         // 本设备仍只有旧身份记录；新身份在另一设备的版本和别人的版本
         // 都不属于本设备的 CAS 行，不能替代或重置旧版本 5。
-        let records = vec![
+        let mut records = vec![
             record(&conv, &me, &device, 1, 5),
             record(&conv, &me, &other_device, 2, 90),
             record(&conv, &other, &device, 2, 70),
         ];
+        // 重置后旧密文解不开，但已验签的版本号仍必须参与 CAS。
+        records[0].body = None;
         assert_eq!(next_revision(&records, &me, &device.id()).unwrap(), 6);
         assert_eq!(next_revision(&[], &me, &device.id()).unwrap(), 1);
     }
