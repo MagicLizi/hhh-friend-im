@@ -54,6 +54,7 @@ pub(crate) struct State {
     pub name: String,
     pub epoch: u32,
     pub status: DeviceStatus,
+    pub reading: bool,
     /// 当前连接登录时服务器的日志序号：新电脑从这里开始同步。
     pub sync_head: u64,
     /// 处理到的日志序号。
@@ -509,6 +510,7 @@ impl State {
     /// 处理一条服务器推送。
     pub async fn handle_push(&mut self, conn: &Conn, push: Push) -> Flow {
         match push {
+            Push::ReadingChanged { conv } => self.emit(Update::ReadingChanged { conv }),
             Push::Event { event } => {
                 let log = event.log;
                 self.process_event(conn, event).await;

@@ -114,6 +114,7 @@ impl Client {
             name: welcome.name.clone(),
             epoch: welcome.epoch,
             status: welcome.status,
+            reading: welcome.reading,
             sync_head: welcome.sync_head,
             position,
             book: Book::default(),
@@ -496,6 +497,7 @@ async fn reconnect(inner: &Arc<Inner>) -> Result<mpsc::Receiver<Push>> {
         state.keys.clear();
     }
     state.status = welcome.status;
+    state.reading = welcome.reading;
     state.sync_head = welcome.sync_head;
     state.epoch = welcome.epoch;
     state.clock = connected.clock;

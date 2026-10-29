@@ -101,6 +101,27 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
     let outbox = live.outbox.clone();
     while let Some(update) = updates.recv().await {
         match update {
+            Update::ReadingChanged { conv } => {
+                if server
+                    .reading_events
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    match live.client.reading_through(&conv).await {
+                        Ok(through) => server.peer.notify(
+                            "reading/changed",
+                            hhh_im_protocol::reading::ReadState {
+                                scope: hhh_im_protocol::reading::ReadScope {
+                                    conversation_id: conv.to_string(),
+                                    thread_root: None,
+                                },
+                                through: through.map(|p| p.to_string()),
+                                read_message_ids: Vec::new(),
+                            },
+                        ),
+                        Err(error) => tracing::warn!(%error,"阅读变更未核实，保留原未读"),
+                    }
+                }
+            }
             Update::Connected { status } => {
                 server.peer.notify("status", StatusParams { state: ConnState::Online, reason: None });
                 if status != DeviceStatus::Active {

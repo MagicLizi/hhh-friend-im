@@ -41,6 +41,8 @@ pub mod ctx {
     pub const KDF_ACCOUNT_PREV: &str = "friend-im/v1/account/prev";
     pub const KDF_CONV_MSG: &str = "friend-im/v1/conv/msg";
     pub const KDF_CONV_PROFILE: &str = "friend-im/v1/conv/profile";
+    pub const KDF_CONV_READING: &str = "friend-im/v1/conv/reading-key";
+    pub const READING: &str = "friend-im/v1/reading";
     pub const KDF_CONV_PREV: &str = "friend-im/v1/conv/prev";
     pub const KDF_CONV_COMMIT: &str = "friend-im/v1/conv/commit";
     pub const KDF_INVITE_SIGN: &str = "friend-im/v1/invite/sign";

@@ -215,6 +215,8 @@ pub enum AccountNotice {
 /// 推给上层的更新。
 #[derive(Clone, Debug)]
 pub enum Update {
+    /// 阅读事实变了；上层只读补查，不作为新消息或本人查看。
+    ReadingChanged { conv: ConvId },
     /// 连上了服务器。
     Connected {
         /// 这台电脑的状态。

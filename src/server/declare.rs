@@ -92,6 +92,30 @@ pub(crate) fn platform() -> PlatformDesc {
 /// 能力：做得到的都声明，做不到的（搜索、编辑、表情、定位私聊）不声明。
 pub(crate) fn capabilities() -> Capabilities {
     Capabilities {
+        receipts: Some(hhh_im_protocol::reading::ReceiptCaps {
+            scopes: hhh_im_protocol::reading::ReadScopes {
+                conversations: true,
+                threads: false,
+            },
+            readers: true,
+            unreaders: true,
+            max_age_secs: None,
+        }),
+        mark_read: Some(hhh_im_protocol::reading::MarkReadCaps {
+            scopes: hhh_im_protocol::reading::ReadScopes {
+                conversations: true,
+                threads: false,
+            },
+            per_minute: 60,
+        }),
+        read_sync: Some(hhh_im_protocol::reading::ReadSyncCaps {
+            scopes: hhh_im_protocol::reading::ReadScopes {
+                conversations: true,
+                threads: false,
+            },
+            watermark: true,
+            individual: false,
+        }),
         rich_send: Default::default(),
         stickers: Default::default(),
         conversations: ConversationCaps {
@@ -102,6 +126,7 @@ pub(crate) fn capabilities() -> Capabilities {
             recent_activity: true,
         },
         messages: MessageCaps {
+            forwarded: false,
             list: true,
             get: false,
         },

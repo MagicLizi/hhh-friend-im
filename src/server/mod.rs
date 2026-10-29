@@ -21,6 +21,7 @@ mod methods;
 mod peer;
 mod profile;
 mod push;
+mod reading;
 mod resources;
 mod session;
 mod translate;
@@ -60,6 +61,7 @@ impl Default for Options {
 /// 一个插件进程里的全部状态。
 pub(crate) struct Server {
     pub(crate) peer: Peer,
+    pub(crate) reading_events: std::sync::atomic::AtomicBool,
     pub(crate) options: Options,
     /// 在线的账号（没上线为空）。
     pub(crate) state: RwLock<Option<Arc<session::Live>>>,
@@ -178,6 +180,7 @@ impl Server {
         (
             Arc::new(Self {
                 peer,
+                reading_events: std::sync::atomic::AtomicBool::new(false),
                 options,
                 state: RwLock::new(None),
                 uploads: resources::Uploads::default(),
@@ -265,11 +268,17 @@ impl Server {
         Some(match known {
             Method::Initialize => {
                 params(value).and_then(|p: hhh_im_protocol::method::InitializeParams| {
+                    self.reading_events
+                        .store(p.reading_events, std::sync::atomic::Ordering::Relaxed);
                     self.uploads.set_dir(&p.temp_dir);
                     declare::initialize(&p)
                 })
             }
             Method::Ping => Ok(serde_json::json!({})),
+            Method::ReadingReceipts => self.reading_receipts(value).await,
+            Method::ReadingPeople => self.reading_people(value).await,
+            Method::ReadingSync => self.reading_sync(value).await,
+            Method::ReadingMark => self.reading_mark(value).await,
             Method::Shutdown => {
                 self.close_session().await;
                 Ok(serde_json::json!({}))

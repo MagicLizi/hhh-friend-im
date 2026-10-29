@@ -23,6 +23,7 @@ use crate::error::Result;
 use crate::ids::{ConvId, DeviceId, FileId, InviteId, MsgId, RequestId, Uid};
 use crate::keys::{DevicePublic, DeviceSecret};
 use crate::message::Envelope;
+use crate::reading::{ReadingEnvelope, StoredReading};
 
 /// 接口版本。
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -447,6 +448,12 @@ pub enum Request {
     },
     /// 保活。
     Ping,
+    /// 阅读扩展的精确消息查询；不推进任何阅读位置。
+    ReadingMessages { conv: ConvId, ids: Vec<MsgId> },
+    /// 分页取各设备最新的加密阅读记录。after 是服务端记录序号。
+    ReadingGet { conv: ConvId, after: u64, limit: u32 },
+    /// 写本设备的下一版加密阅读记录；相同记录幂等，旧版不能覆盖新版。
+    ReadingSet { envelope: ReadingEnvelope },
 }
 
 /// 账号签名链的一环 + 服务器日志序号。
@@ -623,6 +630,9 @@ pub struct SyncEvent {
 /// `hello` 成功后的回执。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
+    /// 可选扩展：没有该字段的旧服务器不提供阅读方法。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reading: bool,
     /// 账号。
     pub uid: Uid,
     /// 名字（来自 Cindy）。
@@ -646,6 +656,12 @@ pub struct Welcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
+    /// 阅读范围内的确切消息。
+    ReadingMessages { messages: Vec<StoredMessage> },
+    /// 最新阅读记录分页。
+    ReadingPage { records: Vec<StoredReading>, more: bool },
+    /// 平台已接受这份阅读记录。
+    ReadingSaved { log: u64 },
     /// 登录成功。
     Welcome {
         /// 内容。
@@ -838,6 +854,8 @@ pub enum JoinCloseReason {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Push {
+    /// 只发给主动调用阅读扩展的连接，不进入旧客户端的补拉事件流。
+    ReadingChanged { conv: ConvId },
     /// 同步事件。
     Event {
         /// 事件。
