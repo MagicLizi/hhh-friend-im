@@ -46,7 +46,7 @@ impl Server {
                 .into_iter()
                 .map(|r| MessageReceipt {
                     message_id: r.message.to_string(),
-                    read_count: Some(r.readers.len() as u32),
+                    read_count: r.complete.then_some(r.readers.len() as u32),
                     total_count: r
                         .complete
                         .then_some((r.readers.len() + r.unreaders.len()) as u32),
