@@ -100,12 +100,14 @@ fn block(part: &Part, names: &Names) -> Block {
             name: Some(file.name.clone()),
             width: *width,
             height: *height,
+            aspect_only: false,
         },
         Part::File { file } => Block::Resource {
             resource: resource(file, ResourceKind::File),
             name: Some(file.name.clone()),
             width: None,
             height: None,
+            aspect_only: false,
         },
     }
 }

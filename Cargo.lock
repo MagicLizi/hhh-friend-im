@@ -467,8 +467,8 @@ dependencies = [
 
 [[package]]
 name = "hhh-im-protocol"
-version = "0.18.0"
-source = "git+https://github.com/MagicLizi/hhh-im-sdk?tag=v0.18.0#da451d121d7259ec0b33836c5e4f29c0010dd70d"
+version = "0.20.0"
+source = "git+https://github.com/MagicLizi/hhh-im-sdk?tag=v0.20.0#7bcd68cbf45360017625a9cc48bfbdefc6777ab3"
 dependencies = [
  "serde",
  "serde_json",
