@@ -62,7 +62,43 @@ pub enum Part {
     File {
         /// 加密文件。
         file: FileRef,
+        /// 视频信息（发送方取的封面、时长与宽高，契约 friend/video-preview v3）；不是视频或没取到时没有。
+        /// 旧版不认识这个字段，读到的还是一个文件。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video: Option<VideoInfo>,
     },
+}
+
+/// 视频封面文件的上限（与宿主交来的视频封面同一上限，契约 hhh-im client v46）。
+pub const COVER_MAX: u64 = 256 * 1024;
+
+/// 视频文件附带的视频信息：封面是同一会话里另一个加密文件（服务器只看到多了一个文件），时长与宽高明文写在加了密的正文里。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoInfo {
+    /// 封面图（JPEG、PNG 或 WebP，至多 [`COVER_MAX`] 字节）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<FileRef>,
+    /// 画面宽（像素）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// 画面高（像素）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// 时长（毫秒）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+impl VideoInfo {
+    fn check(&self) -> Result<()> {
+        if let Some(cover) = &self.cover {
+            cover.check()?;
+            if !matches!(cover.mime.as_str(), "image/jpeg" | "image/png" | "image/webp") || cover.size > COVER_MAX {
+                return Err(CoreError::format("视频封面不对"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 消息内容。
@@ -117,7 +153,11 @@ impl Content {
             }
             for part in parts {
                 match part {
-                    Part::Image { file, .. } | Part::File { file } => file.check()?,
+                    Part::Image { file, .. } | Part::File { file, video: None } => file.check()?,
+                    Part::File { file, video: Some(video) } => {
+                        file.check()?;
+                        video.check()?;
+                    }
                     Part::Mention { uid: None, everyone: false, .. } => {
                         return Err(CoreError::format("提及缺少对象"));
                     }
@@ -295,6 +335,7 @@ mod tests {
                     name: "a.txt".into(),
                     mime: "text/plain".into(),
                 },
+                video: None,
             });
         }
         let envelope = Envelope::seal(&conv, MsgId::random(), 1, &seed, &sender, &body).unwrap();
@@ -407,6 +448,53 @@ mod tests {
         for bad in ["http://avatar.example.com/a.png".to_owned(), format!("https://a.com/{}", "x".repeat(AVATAR_URL_MAX)), "https://a.com/a b".into()] {
             let body = MessageBody { v: MESSAGE_VERSION, ctime_ms: 1, content: Content::Profile { avatar: Some(bad.clone()), photo: None } };
             assert!(Envelope::seal(&conv, MsgId::random(), 1, &seed, &sender, &body).is_err(), "{bad}");
+        }
+    }
+
+    fn video_part(cover: Option<FileRef>) -> Part {
+        Part::File {
+            file: FileRef { id: FileId::random(), key: Fixed([5; 32]), size: 9_000_000, name: "clip.mp4".into(), mime: "video/mp4".into() },
+            video: Some(VideoInfo { cover, width: Some(1080), height: Some(1920), duration_ms: Some(3400) }),
+        }
+    }
+
+    // 契约 friend/video-preview v3：视频文件带封面与视频信息，照样加密签名、密文里找不到封面编号；旧版（只认 file 的写法）
+    // 读到的还是一个文件，不会解析失败；封面只收 JPEG / PNG / WebP、不超过 COVER_MAX；旧消息照读。
+    #[test]
+    fn a_video_file_carries_an_encrypted_cover_and_old_readers_see_a_file() {
+        let (uid, device) = sender_parts();
+        let conv = ConvId::random();
+        let seed = ConvSeed::generate();
+        let sender = Sender { uid: &uid, eldest: Fixed([1; 32]), device: &device };
+        let cover = FileRef { id: FileId::random(), key: Fixed([6; 32]), size: 40_000, name: "cover.jpg".into(), mime: "image/jpeg".into() };
+        let post = |part: Part| MessageBody { v: MESSAGE_VERSION, ctime_ms: 1, content: Content::Post { parts: vec![part], reply_to: None } };
+        let body = post(video_part(Some(cover.clone())));
+        let envelope = Envelope::seal(&conv, MsgId::random(), 1, &seed, &sender, &body).unwrap();
+        assert_eq!(envelope.open(&seed, &device.public()).unwrap(), body);
+        assert!(!serde_json::to_string(&envelope).unwrap().contains(cover.id.as_str()), "服务器看不到封面文件");
+
+        // 旧版的正文段只有 file：读新版写的视频不报错，还是一个文件。
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldPart {
+            File { file: FileRef },
+        }
+        let Content::Post { parts, .. } = &body.content else { unreachable!() };
+        let old: OldPart = serde_json::from_value(serde_json::to_value(&parts[0]).unwrap()).unwrap();
+        assert!(matches!(&old, OldPart::File { file } if file.name == "clip.mp4"), "{old:?}");
+        // 旧消息（没有 video）照读，写回不多出键。
+        let plain = serde_json::json!({ "type": "file", "file": serde_json::to_value(&cover).unwrap() });
+        let read: Part = serde_json::from_value(plain.clone()).unwrap();
+        assert!(matches!(&read, Part::File { video: None, .. }));
+        assert_eq!(serde_json::to_value(&read).unwrap(), plain);
+        // 只有时长、宽高也行。
+        assert!(Envelope::seal(&conv, MsgId::random(), 1, &seed, &sender, &post(video_part(None))).is_ok());
+
+        for bad in [
+            FileRef { mime: "image/gif".into(), ..cover.clone() },
+            FileRef { size: COVER_MAX + 1, ..cover.clone() },
+        ] {
+            assert!(Envelope::seal(&conv, MsgId::random(), 1, &seed, &sender, &post(video_part(Some(bad)))).is_err());
         }
     }
 
