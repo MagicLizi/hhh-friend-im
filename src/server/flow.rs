@@ -201,15 +201,6 @@ impl Ui<'_> {
         })));
     }
 
-    /// 会话级操作做完，请宿主把这个会话从列表里拿掉（`removeFromList`，HHH 契约 provider-protocol v18 §2）：宿主当作取消
-    /// 关注，对话框直接关掉；有新消息时会话照样回到列表。不认这个字段的旧宿主只关对话框。
-    pub(crate) fn done_removing_from_list(&self) {
-        self.peer.notify(
-            "action/finished",
-            json!({ "flowId": self.flow_id, "removeFromList": true }),
-        );
-    }
-
     /// 没做成。
     pub(crate) fn fail(&self, title: Option<&str>, message: &str, retry: Option<&str>) {
         let method = if self.kind == Kind::Login {
