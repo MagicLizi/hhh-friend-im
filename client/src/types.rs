@@ -43,7 +43,12 @@ impl Credentials {
 
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Credentials({}, 登录凭证：{})", self.device.id(), if self.session.is_some() { "有" } else { "无" })
+        write!(
+            f,
+            "Credentials({}, 登录凭证：{})",
+            self.device.id(),
+            if self.session.is_some() { "有" } else { "无" }
+        )
     }
 }
 
@@ -157,7 +162,9 @@ impl Notice {
     pub(crate) fn from_link(conv: &ConvId, link: &ConvLink, log: u64) -> Option<Self> {
         let body = link.parse().ok()?;
         let change = match body.change {
-            ConvChange::Create { kind, members, via, .. } => ConvNotice::Created {
+            ConvChange::Create {
+                kind, members, via, ..
+            } => ConvNotice::Created {
                 kind,
                 members: members.into_iter().map(|m| m.uid).collect(),
                 via,
@@ -217,6 +224,8 @@ pub enum AccountNotice {
 pub enum Update {
     /// 阅读事实变了；上层只读补查，不作为新消息或本人查看。
     ReadingChanged { conv: ConvId },
+    /// 好友申请变化；重新查询当前账号的列表。
+    FriendRequestsChanged,
     /// 连上了服务器。
     Connected {
         /// 这台电脑的状态。

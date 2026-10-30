@@ -41,6 +41,85 @@ fn directory_page(
 }
 
 impl Server {
+    pub(crate) async fn contact_profile(
+        &self,
+        target: hhh_im_protocol::contacts::ContactTarget,
+        add: bool,
+    ) -> Result<Value, RpcError> {
+        use friend_im_client::core::ids::Uid;
+        use hhh_im_protocol::contacts::{ContactProfile, ContactRelationship, valid_target};
+        if !valid_target(&target) {
+            return Err(errors::of(ErrorKind::InvalidRequest, "群成员身份无效。"));
+        }
+        let group = ConvId::parse(&target.conversation_id)
+            .map_err(|_| errors::of(ErrorKind::InvalidRequest, "群编号无效。"))?;
+        let user = Uid::parse(&target.user_id)
+            .map_err(|_| errors::of(ErrorKind::InvalidRequest, "成员编号无效。"))?;
+        let live = self.live().await?;
+        let info = live
+            .client
+            .conv_info(&group)
+            .await
+            .map_err(|e| errors::client(&e))?;
+        if info.kind != ConvKind::Group
+            || !info.member
+            || !info.members.iter().any(|m| m.uid == user)
+        {
+            return Err(errors::of(
+                ErrorKind::PermissionDenied,
+                "你或对方已不在这个群里，请刷新群成员。",
+            ));
+        }
+        let profile = if user == live.me {
+            if add {
+                return Err(errors::of(
+                    ErrorKind::InvalidRequest,
+                    "不能添加自己为好友。",
+                ));
+            }
+            ContactProfile {
+                relationship: ContactRelationship::SelfAccount,
+                conversation_id: None,
+                can_add: false,
+            }
+        } else {
+            let mut direct = None;
+            for summary in live.client.convs().await.map_err(|e| errors::client(&e))? {
+                if summary.member && summary.kind == ConvKind::Dm {
+                    // A failed read is unknown, never evidence that this person is not a contact.
+                    let dm = live
+                        .client
+                        .conv_info(&summary.conv)
+                        .await
+                        .map_err(|e| errors::client(&e))?;
+                    if dm.member
+                        && dm.kind == ConvKind::Dm
+                        && dm.members.iter().any(|m| m.uid == user)
+                    {
+                        direct = Some(summary.conv);
+                        break;
+                    }
+                }
+            }
+            if add && direct.is_none() {
+                return Err(errors::of(
+                    ErrorKind::Unsupported,
+                    "添加好友需要对方批准，请升级宿主并通过好友申请发送。",
+                ));
+            }
+            ContactProfile {
+                relationship: if direct.is_some() {
+                    ContactRelationship::Contact
+                } else {
+                    ContactRelationship::NotContact
+                },
+                can_add: direct.is_none(),
+                conversation_id: direct.map(|id| id.to_string()),
+            }
+        };
+        Ok(serde_json::to_value(profile).expect("contact profile serializes"))
+    }
+
     pub(crate) async fn contacts_list(
         &self,
         params: ConversationsListParams,
