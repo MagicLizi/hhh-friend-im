@@ -16,7 +16,8 @@ use friend_im_client::core::ids::{FileId, MsgId, Uid};
 use friend_im_client::core::message::{Content, Part};
 use friend_im_client::{ConvNotice, HistoryItem, Message, Notice};
 use hhh_im_protocol::types::{
-    Block, Message as Wire, Outgoing, PersonKind, Resource, ResourceKind, Sender, SenderKind,
+    Block, Message as Wire, Outgoing, OutgoingVideo, PersonKind, Resource, ResourceCover,
+    ResourceKind, Sender, SenderKind,
 };
 
 /// 账号编号 → 名字（只用来显示；没有的写“有人”）。
@@ -102,13 +103,27 @@ fn block(part: &Part, names: &Names) -> Block {
             height: *height,
             aspect_only: false,
         },
-        Part::File { file } => Block::Resource {
-            resource: resource(file, ResourceKind::File),
-            name: Some(file.name.clone()),
-            width: None,
-            height: None,
-            aspect_only: false,
-        },
+        Part::File { file, video } => {
+            // 发送方带的视频信息（契约 friend/video-preview v3）：封面是另一个加密文件，按图片读；宽高是画面的。
+            let video = video.as_ref();
+            Block::Resource {
+                resource: Resource {
+                    duration_ms: video.and_then(|v| v.duration_ms),
+                    cover: video
+                        .and_then(|v| v.cover.as_ref())
+                        .map(|cover| ResourceCover {
+                            key: resource_key(cover),
+                            width: None,
+                            height: None,
+                        }),
+                    ..resource(file, ResourceKind::File)
+                },
+                name: Some(file.name.clone()),
+                width: video.and_then(|v| v.width),
+                height: video.and_then(|v| v.height),
+                aspect_only: false,
+            }
+        }
     }
 }
 
@@ -360,8 +375,12 @@ pub(crate) fn conv_rejected(conv: &str, log: u64, at_ms: i64) -> Wire {
 pub(crate) enum Piece {
     /// 文字、提及。
     Part(Part),
-    /// 图片或文件：上传的暂存键。
-    Attachment { key: String, image: bool },
+    /// 图片或文件：上传的暂存键；视频文件可带宿主给的视频信息（封面也是暂存键，契约 friend/video-preview v3）。
+    Attachment {
+        key: String,
+        image: bool,
+        video: Option<OutgoingVideo>,
+    },
 }
 
 /// HHH 要发的内容 → 要发的几段。提及的编号格式不对时为错误说明。
@@ -389,10 +408,12 @@ pub(crate) fn pieces(content: &[Outgoing]) -> Result<Vec<Piece>, String> {
                 Outgoing::Image { key } => Piece::Attachment {
                     key: key.clone(),
                     image: true,
+                    video: None,
                 },
-                Outgoing::File { key } => Piece::Attachment {
+                Outgoing::File { key, video } => Piece::Attachment {
                     key: key.clone(),
                     image: false,
+                    video: video.clone(),
                 },
             })
         })
@@ -477,7 +498,10 @@ mod tests {
                 width: Some(640),
                 height: Some(480),
             },
-            Part::File { file: file() },
+            Part::File {
+                file: file(),
+                video: None,
+            },
         ];
         let out = message(
             &msg(Some(Content::Post {
@@ -504,6 +528,61 @@ mod tests {
         assert_eq!(json[4]["resource"]["bytes"], 70_000);
         assert_eq!(json[4]["name"], "照片.png");
         assert!(file_of_key(json[4]["resource"]["key"].as_str().unwrap()).is_some());
+        assert!(
+            json[4]["resource"].get("cover").is_none() && json[4].get("width").is_none(),
+            "没有视频信息的文件与原来一致"
+        );
+    }
+
+    // 契约 friend/video-preview v3：收到带视频信息的文件，资源块带封面（另一个加密文件的资源键，按图片读）、时长与画面宽高。
+    #[test]
+    fn a_video_file_brings_its_cover_duration_and_size() {
+        use friend_im_client::core::message::VideoInfo;
+        let video = FileRef {
+            name: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            size: 9_000_000,
+            ..file()
+        };
+        let cover = FileRef {
+            id: FileId::from_raw([9; 16]),
+            name: "cover.jpg".into(),
+            mime: "image/jpeg".into(),
+            size: 40_000,
+            ..file()
+        };
+        let parts = vec![Part::File {
+            file: video,
+            video: Some(VideoInfo {
+                cover: Some(cover.clone()),
+                width: Some(1080),
+                height: Some(1920),
+                duration_ms: Some(3400),
+            }),
+        }];
+        let out = message(
+            &msg(Some(Content::Post {
+                parts,
+                reply_to: None,
+            })),
+            &Names::new(),
+        )
+        .unwrap();
+        let Block::Resource {
+            resource,
+            width,
+            height,
+            ..
+        } = &out.content[0]
+        else {
+            panic!("{:?}", out.content[0]);
+        };
+        assert_eq!(resource.kind, ResourceKind::File);
+        assert_eq!(resource.duration_ms, Some(3400));
+        assert_eq!((*width, *height), (Some(1080), Some(1920)));
+        let cover_key = &resource.cover.as_ref().unwrap().key;
+        let read = file_of_key(cover_key).unwrap();
+        assert_eq!((read.id, read.key, read.size), (cover.id, cover.key, cover.size), "按封面的资源键读得出封面文件");
     }
 
     #[test]
@@ -618,9 +697,25 @@ mod tests {
             },
             Outgoing::MentionAll,
             Outgoing::Image { key: "u.1".into() },
-            Outgoing::File { key: "u.2".into() },
+            Outgoing::File {
+                key: "u.2".into(),
+                video: None,
+            },
+            Outgoing::File {
+                key: "u.3".into(),
+                video: Some(OutgoingVideo {
+                    cover: Some("u.4".into()),
+                    duration_ms: Some(3400),
+                    width: Some(1080),
+                    height: Some(1920),
+                }),
+            },
         ];
         let pieces = pieces(&content).unwrap();
+        assert!(
+            matches!(&pieces[5], Piece::Attachment { image: false, video: Some(v), .. } if v.cover.as_deref() == Some("u.4")),
+            "视频信息跟着文件走"
+        );
         assert!(
             matches!(&pieces[1], Piece::Part(Part::Mention { uid: Some(u), .. }) if *u == uid(2))
         );
@@ -629,7 +724,14 @@ mod tests {
             Piece::Part(Part::Mention { everyone: true, .. })
         ));
         assert!(matches!(&pieces[3], Piece::Attachment { image: true, .. }));
-        assert!(matches!(&pieces[4], Piece::Attachment { image: false, .. }));
+        assert!(matches!(
+            &pieces[4],
+            Piece::Attachment {
+                image: false,
+                video: None,
+                ..
+            }
+        ));
         assert!(pieces_err(&[Outgoing::Mention {
             user_id: "不是编号".into(),
             name: "x".into()

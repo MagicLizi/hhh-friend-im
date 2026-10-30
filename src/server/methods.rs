@@ -9,9 +9,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use friend_im_client::core::file::FileRef;
 use friend_im_client::core::ids::{ConvId, MsgId, Uid};
 use friend_im_client::core::limits::HISTORY_PAGE_MAX;
-use friend_im_client::core::message::{Content, Part};
+use friend_im_client::core::message::{COVER_MAX, Content, Part, VideoInfo};
 use friend_im_client::core::wire::ConvActivity;
 use friend_im_client::{ClientError, HistoryItem};
 use hhh_im_protocol::method::{
@@ -20,7 +21,7 @@ use hhh_im_protocol::method::{
     PeopleGetParams, PeopleGetResult, RecentActivityParams, RecentActivityResult,
 };
 use hhh_im_protocol::rpc::{ErrorKind, RpcError};
-use hhh_im_protocol::types::{Person, PersonKind, SendOutcome, SendTarget};
+use hhh_im_protocol::types::{OutgoingVideo, Person, PersonKind, SendOutcome, SendTarget};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
@@ -127,6 +128,30 @@ pub(crate) fn send_id(me: &Uid, operation: &str) -> MsgId {
     let mut raw = [0u8; 16];
     raw.copy_from_slice(&digest[..16]);
     MsgId::from_raw(raw)
+}
+
+/// 读暂存文件的开头（认类型用）与图片宽高；读不了是空的。
+fn head_of(path: &std::path::Path) -> (Vec<u8>, Option<imagesize::ImageSize>) {
+    use std::io::Read as _;
+    let mut head = vec![0u8; 64 * 1024];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    head.truncate(n);
+    (head, imagesize::size(path).ok())
+}
+
+#[cfg(not(target_os = "wasi"))]
+async fn read_head(path: std::path::PathBuf) -> (Vec<u8>, Option<imagesize::ImageSize>) {
+    tokio::task::spawn_blocking(move || head_of(&path))
+        .await
+        .unwrap_or_default()
+}
+
+/// WASI 构建没有后台线程：就地读（只读文件头）。
+#[cfg(target_os = "wasi")]
+async fn read_head(path: std::path::PathBuf) -> (Vec<u8>, Option<imagesize::ImageSize>) {
+    head_of(&path)
 }
 
 fn mime_of(name: &str, image: bool, head: &[u8]) -> String {
@@ -445,9 +470,14 @@ impl Server {
         for piece in pieces {
             match piece {
                 Piece::Part(part) => parts.push(part),
-                Piece::Attachment { key, image } => {
-                    parts.push(self.upload_attachment(&live, &conv, &key, image).await?);
+                Piece::Attachment { key, image, video } => {
+                    parts.push(
+                        self.upload_attachment(&live, &conv, &key, image, video.as_ref())
+                            .await?,
+                    );
                     used.push(key);
+                    // 封面传没传上去，发出去后暂存都不要了（没传上的这条就不带封面）。
+                    used.extend(video.and_then(|v| v.cover));
                 }
             }
         }
@@ -503,37 +533,22 @@ impl Server {
         }))
     }
 
-    /// 暂存的附件：读宽高（图片），加密上传到这个会话，换成消息正文里的一段。
+    /// 暂存的附件：读宽高（图片），加密上传到这个会话，换成消息正文里的一段。视频文件带宿主给的视频信息时，
+    /// 封面也加密上传成同一会话里的一个文件（契约 friend/video-preview v3）；封面传不上去这条照常发，只是不带封面。
     async fn upload_attachment(
         &self,
         live: &Live,
         conv: &ConvId,
         key: &str,
         image: bool,
+        video: Option<&OutgoingVideo>,
     ) -> Result<Part, RpcError> {
         let attachment = self
             .uploads
             .attachment(key)
             .await
             .ok_or_else(|| errors::of(ErrorKind::NotFound, "附件已经过期，要重新上传。"))?;
-        let path = attachment.path.clone();
-        let read_head = move || {
-            use std::io::Read as _;
-            let mut head = vec![0u8; 64 * 1024];
-            let n = std::fs::File::open(&path)
-                .and_then(|mut f| f.read(&mut head))
-                .unwrap_or(0);
-            head.truncate(n);
-            let size = imagesize::size(&path).ok();
-            (head, size)
-        };
-        #[cfg(not(target_os = "wasi"))]
-        let (head, size) = tokio::task::spawn_blocking(read_head)
-            .await
-            .unwrap_or_default();
-        // WASI 构建没有后台线程：就地读（只读文件头）。
-        #[cfg(target_os = "wasi")]
-        let (head, size) = read_head();
+        let (head, size) = read_head(attachment.path.clone()).await;
         let image = image || attachment.image;
         let mime = mime_of(&attachment.name, image, &head);
         let file = std::fs::File::open(&attachment.path).map_err(|error| {
@@ -548,15 +563,74 @@ impl Server {
                 tracing::info!(%conv, %error, "附件上传没成");
                 errors::client(&error)
             })?;
-        Ok(if image {
-            Part::Image {
+        if image {
+            return Ok(Part::Image {
                 file: uploaded,
                 width: size.map(|s| s.width as u32),
                 height: size.map(|s| s.height as u32),
+            });
+        }
+        let video = match video {
+            Some(video) => {
+                let cover = match &video.cover {
+                    Some(cover) => self.upload_cover(live, conv, cover).await,
+                    None => None,
+                };
+                Some(VideoInfo {
+                    cover,
+                    width: video.width,
+                    height: video.height,
+                    duration_ms: video.duration_ms,
+                })
+                .filter(|v| v != &VideoInfo::default())
             }
-        } else {
-            Part::File { file: uploaded }
+            None => None,
+        };
+        Ok(Part::File {
+            file: uploaded,
+            video,
         })
+    }
+
+    /// 视频封面：要是暂存好的 JPEG、PNG 或 WebP、不超过 [`COVER_MAX`]，加密上传成这个会话里的一个文件。
+    /// 哪一步不行都只记一笔、不带封面（封面只是锦上添花，不让视频发不出去）。
+    async fn upload_cover(&self, live: &Live, conv: &ConvId, key: &str) -> Option<FileRef> {
+        let Some(attachment) = self.uploads.attachment(key).await else {
+            tracing::warn!(%conv, "视频封面的暂存找不到，这条不带封面");
+            return None;
+        };
+        if attachment.bytes > COVER_MAX {
+            tracing::warn!(%conv, bytes = attachment.bytes, "视频封面太大，这条不带封面");
+            return None;
+        }
+        let (head, _) = read_head(attachment.path.clone()).await;
+        let mime = match imagesize::image_type(&head) {
+            Ok(imagesize::ImageType::Jpeg) => "image/jpeg",
+            Ok(imagesize::ImageType::Png) => "image/png",
+            Ok(imagesize::ImageType::Webp) => "image/webp",
+            _ => {
+                tracing::warn!(%conv, "视频封面不是 JPEG、PNG 或 WebP，这条不带封面");
+                return None;
+            }
+        };
+        let file = match std::fs::File::open(&attachment.path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(%error, "打不开暂存的视频封面，这条不带封面");
+                return None;
+            }
+        };
+        match live
+            .client
+            .upload(conv, file, attachment.bytes, &attachment.name, mime)
+            .await
+        {
+            Ok(cover) => Some(cover),
+            Err(error) => {
+                tracing::warn!(%conv, %error, "视频封面上传没成，这条不带封面");
+                None
+            }
+        }
     }
 
     /// `messages/recall`：撤回自己的一条（服务器上的密文随之删除）。

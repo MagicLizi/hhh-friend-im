@@ -145,6 +145,8 @@ pub(crate) fn capabilities() -> Capabilities {
             image: true,
             file: true,
             lookup: true,
+            // 发视频时宿主带上发送方取的封面、时长与宽高（契约 friend/video-preview v3）：服务器看不到视频，只能由发送方给。
+            video_info: true,
         }),
         recall: true,
         edit: false,
