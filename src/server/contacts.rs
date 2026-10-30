@@ -102,12 +102,10 @@ impl Server {
                 }
             }
             if add && direct.is_none() {
-                direct = Some(
-                    live.client
-                        .open_dm(&user, &group)
-                        .await
-                        .map_err(|e| errors::client(&e))?,
-                );
+                return Err(errors::of(
+                    ErrorKind::Unsupported,
+                    "添加好友需要对方批准，请升级宿主并通过好友申请发送。",
+                ));
             }
             ContactProfile {
                 relationship: if direct.is_some() {

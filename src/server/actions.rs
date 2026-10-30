@@ -413,7 +413,7 @@ impl Server {
             rotate = false;
             ui.step(compact(json!({
                 "kind": "showText", "layout": "line", "text": link_text, "copy": true,
-                "caption": "把这条链接发给想加你的人。对方在 Cindy IM 里粘贴它就能加你为好友，同时核对是你本人。",
+                "caption": "把这条链接发给想加你的人。对方粘贴后可向你发送好友申请，你同意后才成为好友。",
                 "note": tip.take().map(|text| note(text, false)),
                 "links": [link("renew", "换一条链接")],
             })));
@@ -490,34 +490,41 @@ impl Server {
                 warn = Some("这是你自己的好友链接。".into());
                 continue;
             }
-            let step = json!({
-                "kind": "confirm", "caption": format!("加{}为好友？对方不需要再点同意。", info.name), "confirmLabel": "加好友",
-                "person": { "name": info.name, "detail": format!("身份指纹 {} · 和链接里的一致", fingerprint(&link.eldest.0)) },
-            });
-            match confirmed(ui, rx, step).await {
-                None => return,
-                Some(false) => continue,
-                Some(true) => {}
-            }
-            ui.step(waiting("正在添加…"));
-            match live.client.add_friend(&link).await {
-                Ok(conversation) => {
-                    ui.done_opening(&conversation,
-                        Some(&format!("已添加{}", info.name)),
-                        Some("私聊已出现在你们两边的会话列表，第一条提示写着“通过好友链接添加，身份已核对”。"),
+            let Some(message) = verification(
+                ui,
+                rx,
+                &format!("{}（身份指纹 {}）", info.name, fingerprint(&link.eldest.0)),
+            )
+            .await
+            else {
+                return;
+            };
+            ui.step(waiting("正在发送好友申请…"));
+            match live
+                .client
+                .request_link_friend(
+                    &friend_im_client::core::ids::RequestId::random(),
+                    &link,
+                    &message,
+                )
+                .await
+            {
+                Ok(info) => {
+                    let incoming = info.record.envelope.body.to.uid == live.me;
+                    ui.done(
+                        Some(if incoming {
+                            "对方已向你申请"
+                        } else {
+                            "申请已发送"
+                        }),
+                        Some(if incoming {
+                            "请在侧栏“好友申请”中查看并决定是否同意。"
+                        } else {
+                            "等待对方同意，可在侧栏“好友申请”查看进度或撤回。"
+                        }),
                     );
                 }
-                Err(error) if error.code() == Some(ErrorCode::Conflict) => {
-                    ui.fail(
-                        Some("没有添加"),
-                        &format!("你和{}已经是好友了，私聊就在会话列表里。", info.name),
-                        None,
-                    );
-                }
-                Err(error) => {
-                    tracing::info!(%error, "加好友没成");
-                    ui.fail(Some("没有添加"), &said(&error), Some("再试一次"));
-                }
+                Err(error) => ui.fail(Some("申请未完成"), &said(&error), Some("重新查询")),
             }
             return;
         }
@@ -714,27 +721,43 @@ impl Server {
             conversation_id: conv.to_string(),
             user_id: user.to_string(),
         };
-        let mut add = false;
         let mut tip = None;
         loop {
-            ui.step(waiting(if add {
-                "正在添加好友…"
-            } else {
-                "正在确认好友关系…"
-            }));
+            ui.step(waiting("正在确认好友关系…"));
             if !self.live().await.is_ok_and(|current| current.me == live.me) {
                 ui.fail(Some("账号已切换"), "请重新打开成员名片。", None);
                 return true;
             }
-            let result = self.contact_profile(target.clone(), add).await;
-            add = false;
-            let profile: Option<ContactProfile> = match result {
+            let result = self.contact_profile(target.clone(), false).await;
+            let mut profile: Option<ContactProfile> = match result {
                 Ok(value) => serde_json::from_value(value).ok(),
                 Err(error) => {
                     tip = Some(note(&error.message, true));
                     None
                 }
             };
+            let mut pending = None;
+            if profile
+                .as_ref()
+                .is_some_and(|p| p.relationship == ContactRelationship::NotContact)
+            {
+                for incoming in [true, false] {
+                    match live
+                        .client
+                        .friend_requests(incoming, None, Some(user.clone()))
+                        .await
+                    {
+                        Ok(page) => {
+                            if let Some(found)=page.requests.into_iter().find(|r|r.record.status==friend_im_client::core::friends::FriendRequestStatus::Pending){pending=Some(found);}
+                        }
+                        Err(error) => {
+                            tip = Some(note(&said(&error), true));
+                            profile = None;
+                            break;
+                        }
+                    }
+                }
+            }
             let mut actions = Vec::new();
             let detail = match profile.as_ref().map(|p| p.relationship) {
                 Some(ContactRelationship::SelfAccount) => "这是你自己",
@@ -743,10 +766,21 @@ impl Server {
                     "你的好友"
                 }
                 Some(ContactRelationship::NotContact) => {
-                    if profile.as_ref().is_some_and(|p| p.can_add) {
-                        actions.push(json!({"id":"add","label":"添加好友"}));
+                    if let Some(request) = &pending {
+                        if request.record.envelope.body.to.uid == live.me {
+                            actions.push(json!({"id":"reject","label":"拒绝"}));
+                            actions.push(json!({"id":"approve","label":"同意"}));
+                            "请求添加你为好友"
+                        } else {
+                            actions.push(json!({"id":"withdraw","label":"撤回申请"}));
+                            "等待对方同意"
+                        }
+                    } else {
+                        if profile.as_ref().is_some_and(|p| p.can_add) {
+                            actions.push(json!({"id":"add","label":"添加好友"}));
+                        }
+                        "还不是好友"
                     }
-                    "还不是好友"
                 }
                 None => {
                     actions.push(json!({"id":"retry","label":"重新查询"}));
@@ -764,8 +798,46 @@ impl Server {
                 }) if row == user.as_str() => match choice.as_str() {
                     "back" => return false,
                     "retry" => continue,
+                    "approve" | "reject" | "withdraw" if pending.is_some() => {
+                        let request = &pending.as_ref().unwrap().record.envelope.body.id;
+                        if choice=="withdraw" && !confirmed(ui,rx,json!({"kind":"confirm","caption":"撤回申请？撤回后 24 小时内不能再次申请。","confirmLabel":"确认撤回"})).await.unwrap_or(false) {continue;}
+                        let result = if choice == "approve" {
+                            live.client.accept_friend(request).await
+                        } else {
+                            live.client
+                                .close_friend_request(request, choice == "withdraw")
+                                .await
+                        };
+                        if let Err(error) = result {
+                            tip = Some(note(&said(&error), true));
+                        }
+                    }
                     "add" if profile.as_ref().is_some_and(|p| p.can_add) => {
-                        add = true;
+                        let Some(message) = verification(ui, rx, name).await else {
+                            return true;
+                        };
+                        ui.step(waiting("正在发送好友申请…"));
+                        match live
+                            .client
+                            .request_group_friend(
+                                &friend_im_client::core::ids::RequestId::random(),
+                                user,
+                                conv,
+                                &message,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                ui.done(
+                                    Some("申请已提交"),
+                                    Some("请在侧栏“好友申请”查看状态；对方同意后才成为好友。"),
+                                );
+                                return true;
+                            }
+                            Err(error) => {
+                                tip = Some(note(&said(&error), true));
+                            }
+                        }
                     }
                     "message"
                         if profile
@@ -1095,6 +1167,32 @@ async fn about(ui: &Ui<'_>, rx: &mut mpsc::UnboundedReceiver<Input>) {
     }));
     if next(rx).await.is_some() {
         ui.done(None, None);
+    }
+}
+
+/// Optional verification text is bounded before the encrypted write.
+async fn verification(
+    ui: &Ui<'_>,
+    rx: &mut mpsc::UnboundedReceiver<Input>,
+    name: &str,
+) -> Option<String> {
+    let mut warning = None;
+    loop {
+        ui.step(compact(json!({"kind":"input", "caption":format!("向{name}发送好友申请，对方同意后即可发消息。"),
+            "fields":[{"id":"message","label":"验证消息（选填，最多 80 字）","secret":false}],
+            "submitLabel":"发送申请", "note":warning.take()})));
+        match next(rx).await {
+            None => return None,
+            Some(Input::Submit(values)) => {
+                let message = values.get("message").cloned().unwrap_or_default();
+                if message.chars().count() > 80 {
+                    warning = Some(note("验证消息最多 80 字。", true));
+                    continue;
+                }
+                return Some(message);
+            }
+            _ => {}
+        }
     }
 }
 

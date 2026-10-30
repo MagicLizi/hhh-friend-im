@@ -15,6 +15,7 @@ mod contacts;
 mod declare;
 mod errors;
 mod flow;
+mod friend_requests;
 mod log;
 mod login;
 mod methods;
@@ -62,6 +63,7 @@ impl Default for Options {
 pub(crate) struct Server {
     pub(crate) peer: Peer,
     pub(crate) reading_events: std::sync::atomic::AtomicBool,
+    pub(crate) friend_events: std::sync::atomic::AtomicBool,
     pub(crate) options: Options,
     /// 在线的账号（没上线为空）。
     pub(crate) state: RwLock<Option<Arc<session::Live>>>,
@@ -181,6 +183,7 @@ impl Server {
             Arc::new(Self {
                 peer,
                 reading_events: std::sync::atomic::AtomicBool::new(false),
+                friend_events: std::sync::atomic::AtomicBool::new(false),
                 options,
                 state: RwLock::new(None),
                 uploads: resources::Uploads::default(),
@@ -298,6 +301,10 @@ impl Server {
             },
             Method::ContactsProfile | Method::ContactsAdd => match params(value) {
                 Ok(p) => self.contact_profile(p, known == Method::ContactsAdd).await,
+                Err(error) => Err(error),
+            },
+            Method::ContactsRequests => match params(value) {
+                Ok(p) => self.friend_requests(p).await,
                 Err(error) => Err(error),
             },
             Method::ContactsList => match params(value) {

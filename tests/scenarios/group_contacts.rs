@@ -5,21 +5,14 @@ use friend_im_client::{Update, core::conv::GroupProfile};
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn group_profile_reads_never_create_and_explicit_add_reuses_one_encrypted_chat() {
-    let env = Env::start().await;
+async fn group_profile_and_requests_require_recipient_approval_before_encrypted_chat() {
+    let mut env = Env::start().await;
     let (owner, _) = env.account("owner", "owner device").await;
     let (alice, key) = env.account("alice", "alice device").await;
     let (bob, _) = env.account("bob", "bob device").await;
     let (outsider, _) = env.account("outsider", "outsider device").await;
-    alice
-        .client
-        .add_friend(&owner.client.friend_link(false).await.unwrap())
-        .await
-        .unwrap();
-    bob.client
-        .add_friend(&owner.client.friend_link(false).await.unwrap())
-        .await
-        .unwrap();
+    approved_dm(&alice.client, &owner.client).await;
+    approved_dm(&bob.client, &owner.client).await;
     let group = owner
         .client
         .create_group(
@@ -105,22 +98,100 @@ async fn group_profile_reads_never_create_and_explicit_add_reuses_one_encrypted_
         .await
         .is_err()
     );
-    let (first, second) = tokio::join!(
-        host.call("contacts/add", target.clone()),
-        host.call("contacts/add", target.clone())
+    assert!(
+        host.call("contacts/add", target.clone()).await.is_err(),
+        "old host addition cannot bypass approval"
     );
-    let first = first.unwrap();
-    let second = second.unwrap();
-    assert_eq!(first["relationship"], "contact");
-    assert_eq!(first["conversationId"], second["conversationId"]);
+    let recipient_temp = tempfile::tempdir().unwrap();
+    let (recipient, _) = Host::start(recipient_temp.path()).await;
+    let credential = Credential::new(
+        &env.server.url(),
+        bob.client.uid().as_str(),
+        "bob plugin",
+        bob.client.credentials().await,
+    )
+    .encode();
+    bob.client.close();
     assert_eq!(
-        host.call("contacts/profile", target.clone()).await.unwrap()["conversationId"],
-        first["conversationId"]
+        recipient
+            .open(&env.server.url(), Some(&credential), None)
+            .await["state"],
+        "online"
+    );
+    recipient
+        .call(
+            "contacts/requests",
+            json!({"operation":"list","incoming":true}),
+        )
+        .await
+        .unwrap();
+    let id = friend_im_client::core::ids::RequestId::random();
+    let command = json!({"operation":"send","requestId":id.to_string(),"conversationId":group.to_string(),"userId":bob.client.uid().as_str(),"message":"同群的 Alice"});
+    let (first, second) = tokio::join!(
+        host.call("contacts/requests", command.clone()),
+        host.call("contacts/requests", command)
+    );
+    assert_eq!(
+        first.unwrap()["items"][0]["requestId"],
+        second.unwrap()["items"][0]["requestId"]
+    );
+    assert_eq!(
+        host.call("contacts/profile", target.clone()).await.unwrap()["relationship"],
+        "notContact"
+    );
+    let incoming = recipient
+        .call(
+            "contacts/requests",
+            json!({"operation":"list","incoming":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(incoming["pending"], 1);
+    assert_eq!(incoming["items"][0]["message"], "同群的 Alice");
+    assert!(
+        host.call(
+            "contacts/requests",
+            json!({"operation":"respond","requestId":id.to_string(),"action":"accept"})
+        )
+        .await
+        .is_err()
+    );
+    let accepted = recipient
+        .call(
+            "contacts/requests",
+            json!({"operation":"respond","requestId":id.to_string(),"action":"accept"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted["items"][0]["state"], "accepted");
+    let first = host.call("contacts/profile", target.clone()).await.unwrap();
+    assert_eq!(first["relationship"], "contact");
+    assert_eq!(
+        first["conversationId"],
+        accepted["items"][0]["conversationId"]
     );
     assert_eq!(
         host.call("contacts/add", target.clone()).await.unwrap()["conversationId"],
         first["conversationId"]
     );
+    env.server.restart().await;
+    recipient
+        .wait_note("status", |p| p["state"] == "connecting")
+        .await;
+    for _ in 0..100 {
+        if host.call("contacts/profile", target.clone()).await.is_ok()
+            && recipient
+                .call(
+                    "contacts/requests",
+                    json!({"operation":"list","incoming":true}),
+                )
+                .await
+                .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     let flow = host
         .call(
             "actions/start",
@@ -156,8 +227,12 @@ async fn group_profile_reads_never_create_and_explicit_add_reuses_one_encrypted_
             .contains(first["conversationId"].as_str().unwrap()),
         "复用已经添加的私聊"
     );
-    let sent=host.call("messages/send",json!({"operationId":"contact-test-message","target":{"type":"conversation","conversationId":first["conversationId"]},"content":[{"type":"text","text":"名片私聊测试"}]})).await.unwrap();
+    let sent=host.call("messages/send",json!({"operationId":"contact-test-message","target":{"type":"conversation","conversationId":first["conversationId"]},"content":[{"type":"text","text":"approval-message"}]})).await.unwrap();
     assert_eq!(sent["state"], "accepted");
+    recipient.wait_text("approval-message").await;
+    recipient.call("messages/send",json!({"operationId":"contact-test-reply","target":{"type":"conversation","conversationId":first["conversationId"]},"content":[{"type":"text","text":"approval-reply"}]})).await.unwrap();
+    host.wait_text("approval-reply").await;
+    recipient.call("shutdown", json!({})).await.unwrap();
     owner.client.kick(&group, bob.client.uid()).await.unwrap();
     assert!(host.call("contacts/profile", target).await.is_err());
     assert!(

@@ -9,6 +9,7 @@ pub mod conv;
 pub mod crypto;
 pub mod error;
 pub mod file;
+pub mod friends;
 pub mod ids;
 pub mod keys;
 pub mod limits;

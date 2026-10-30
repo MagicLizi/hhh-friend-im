@@ -98,7 +98,9 @@ pub enum DeviceKind {
 }
 
 impl DeviceKind {
-    pub fn is_unknown(&self) -> bool { matches!(self, Self::Computer | Self::Unknown) }
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Computer | Self::Unknown)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -201,6 +203,30 @@ pub struct InviteSeed {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+    /// Submit an encrypted, signed request; never creates a conversation.
+    FriendRequestSend {
+        envelope: crate::friends::FriendRequestEnvelope,
+    },
+    FriendRequests {
+        before: Option<u64>,
+        limit: u32,
+        incoming: bool,
+        peer: Option<Uid>,
+    },
+    FriendRequestGet {
+        request: RequestId,
+    },
+    FriendRequestAccept {
+        request: RequestId,
+        link: ConvLink,
+        keys: ConvKeyBundle,
+    },
+    FriendRequestReject {
+        request: RequestId,
+    },
+    FriendRequestWithdraw {
+        request: RequestId,
+    },
     /// 第一个请求：登录。
     Hello {
         /// 客户端的接口版本。
@@ -449,11 +475,20 @@ pub enum Request {
     /// 保活。
     Ping,
     /// 阅读扩展的精确消息查询；不推进任何阅读位置。
-    ReadingMessages { conv: ConvId, ids: Vec<MsgId> },
+    ReadingMessages {
+        conv: ConvId,
+        ids: Vec<MsgId>,
+    },
     /// 分页取各设备最新的加密阅读记录。after 是服务端记录序号。
-    ReadingGet { conv: ConvId, after: u64, limit: u32 },
+    ReadingGet {
+        conv: ConvId,
+        after: u64,
+        limit: u32,
+    },
     /// 写本设备的下一版加密阅读记录；相同记录幂等，旧版不能覆盖新版。
-    ReadingSet { envelope: ReadingEnvelope },
+    ReadingSet {
+        envelope: ReadingEnvelope,
+    },
 }
 
 /// 账号签名链的一环 + 服务器日志序号。
@@ -630,6 +665,9 @@ pub struct SyncEvent {
 /// `hello` 成功后的回执。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Welcome {
+    /// New DMs require the recipient's explicit approval.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub friend_requests: bool,
     /// 可选扩展：没有该字段的旧服务器不提供阅读方法。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reading: bool,
@@ -656,10 +694,21 @@ pub struct Welcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
+    FriendRequest {
+        request: Box<crate::friends::StoredFriendRequest>,
+    },
+    FriendRequests {
+        requests: Vec<crate::friends::StoredFriendRequest>,
+        next: Option<u64>,
+        pending: u32,
+    },
     /// 阅读范围内的确切消息。
     ReadingMessages { messages: Vec<StoredMessage> },
     /// 最新阅读记录分页。
-    ReadingPage { records: Vec<StoredReading>, more: bool },
+    ReadingPage {
+        records: Vec<StoredReading>,
+        more: bool,
+    },
     /// 平台已接受这份阅读记录。
     ReadingSaved { log: u64 },
     /// 登录成功。
@@ -854,6 +903,8 @@ pub enum JoinCloseReason {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Push {
+    /// Only delivered to connections that subscribed via friend-request methods.
+    FriendRequestsChanged,
     /// 只发给主动调用阅读扩展的连接，不进入旧客户端的补拉事件流。
     ReadingChanged { conv: ConvId },
     /// 同步事件。
@@ -966,17 +1017,37 @@ mod tests {
 
     #[test]
     fn frames_have_stable_shape() {
-        let frame = ClientFrame { id: 7, req: Request::Ping };
-        assert_eq!(serde_json::to_string(&frame).unwrap(), r#"{"id":7,"req":{"op":"ping"}}"#);
-        let res = ServerFrame::Res { id: 7, res: Response::Pong };
-        assert_eq!(serde_json::to_string(&res).unwrap(), r#"{"t":"res","id":7,"res":{"op":"pong"}}"#);
+        let frame = ClientFrame {
+            id: 7,
+            req: Request::Ping,
+        };
+        assert_eq!(
+            serde_json::to_string(&frame).unwrap(),
+            r#"{"id":7,"req":{"op":"ping"}}"#
+        );
+        let res = ServerFrame::Res {
+            id: 7,
+            res: Response::Pong,
+        };
+        assert_eq!(
+            serde_json::to_string(&res).unwrap(),
+            r#"{"t":"res","id":7,"res":{"op":"pong"}}"#
+        );
         let err = ServerFrame::Err {
             id: 8,
             err: WireError::new(ErrorCode::RateLimited, "慢一点"),
         };
-        assert_eq!(serde_json::to_string(&err).unwrap(), r#"{"t":"err","id":8,"err":{"code":"rate_limited","message":"慢一点"}}"#);
-        let push = ServerFrame::Push { push: Push::DeviceRemoved };
-        assert_eq!(serde_json::to_string(&push).unwrap(), r#"{"t":"push","push":{"kind":"device_removed"}}"#);
+        assert_eq!(
+            serde_json::to_string(&err).unwrap(),
+            r#"{"t":"err","id":8,"err":{"code":"rate_limited","message":"慢一点"}}"#
+        );
+        let push = ServerFrame::Push {
+            push: Push::DeviceRemoved,
+        };
+        assert_eq!(
+            serde_json::to_string(&push).unwrap(),
+            r#"{"t":"push","push":{"kind":"device_removed"}}"#
+        );
     }
 
     #[test]
@@ -999,7 +1070,9 @@ mod tests {
             id: 1,
             req: Request::Hello {
                 protocol: PROTOCOL_VERSION,
-                auth: HelloAuth::Session { token: Bytes(vec![1, 2]) },
+                auth: HelloAuth::Session {
+                    token: Bytes(vec![1, 2]),
+                },
                 device: DeviceSecret::generate().public(),
                 name: "台式机".into(),
                 kind: DeviceKind::Computer,
@@ -1022,15 +1095,22 @@ mod tests {
 
     #[test]
     fn unknown_ops_are_rejected() {
-        assert!(serde_json::from_str::<ClientFrame>(r#"{"id":1,"req":{"op":"drop_tables"}}"#).is_err());
+        assert!(
+            serde_json::from_str::<ClientFrame>(r#"{"id":1,"req":{"op":"drop_tables"}}"#).is_err()
+        );
     }
 
     // 已登录的电脑名单是可选字段：旧服务器的回执照样读（没有名单），新回执带上名单能读回来。
     #[test]
     fn join_started_reads_with_and_without_devices() {
         let request = RequestId::random();
-        let old = format!(r#"{{"op":"join_started","request":"{}","attempt":1,"expires_ms":9}}"#, request.as_str());
-        let Response::JoinStarted { devices, .. } = serde_json::from_str(&old).unwrap() else { panic!() };
+        let old = format!(
+            r#"{{"op":"join_started","request":"{}","attempt":1,"expires_ms":9}}"#,
+            request.as_str()
+        );
+        let Response::JoinStarted { devices, .. } = serde_json::from_str(&old).unwrap() else {
+            panic!()
+        };
         assert_eq!(devices, None);
         let res = Response::JoinStarted {
             request,
@@ -1045,7 +1125,10 @@ mod tests {
                 kind: DeviceKind::Computer,
             }]),
         };
-        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&res).unwrap()).unwrap(), res);
+        assert_eq!(
+            serde_json::from_str::<Response>(&serde_json::to_string(&res).unwrap()).unwrap(),
+            res
+        );
     }
 
     #[test]
@@ -1060,11 +1143,23 @@ mod tests {
             recall: None,
             ct: Bytes(vec![1, 2, 3]),
         };
-        let send = ClientFrame { id: 8, req: Request::SendLan { env: env.clone() } };
-        let decoded: ClientFrame = serde_json::from_str(&serde_json::to_string(&send).unwrap()).unwrap();
+        let send = ClientFrame {
+            id: 8,
+            req: Request::SendLan { env: env.clone() },
+        };
+        let decoded: ClientFrame =
+            serde_json::from_str(&serde_json::to_string(&send).unwrap()).unwrap();
         assert_eq!(decoded, send);
-        let release = ClientFrame { id: 9, req: Request::ReleaseMessage { conv: env.conv, id: env.id, direct_devices: vec![DeviceId::random()] } };
-        let decoded: ClientFrame = serde_json::from_str(&serde_json::to_string(&release).unwrap()).unwrap();
+        let release = ClientFrame {
+            id: 9,
+            req: Request::ReleaseMessage {
+                conv: env.conv,
+                id: env.id,
+                direct_devices: vec![DeviceId::random()],
+            },
+        };
+        let decoded: ClientFrame =
+            serde_json::from_str(&serde_json::to_string(&release).unwrap()).unwrap();
         assert_eq!(decoded, release);
     }
 }
