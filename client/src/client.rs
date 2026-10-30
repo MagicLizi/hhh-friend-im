@@ -13,7 +13,9 @@ use friend_im_core::file::FileRef;
 use friend_im_core::ids::{ConvId, DeviceId, InviteId, MsgId, RequestId, Uid};
 use friend_im_core::keys::RecoveryKey;
 use friend_im_core::message::Content;
-use friend_im_core::wire::{AccountInfo, ConvSummary, DeviceInfo, DeviceStatus, ErrorCode, HelloAuth, JoinRequestInfo, Push};
+use friend_im_core::wire::{
+    AccountInfo, ConvSummary, DeviceInfo, DeviceStatus, ErrorCode, HelloAuth, JoinRequestInfo, Push,
+};
 use tokio::sync::mpsc;
 
 use crate::book::Book;
@@ -23,7 +25,7 @@ use crate::keyring::Keyring;
 use crate::lan::{DirectInbound, Lan};
 use crate::links::{FriendLink, InviteLink, http_base, ws_url};
 use crate::state::{Flow, State};
-use crate::types::{ConvInfo, Config, Credentials, HistoryPage, JoinStart, Update};
+use crate::types::{Config, ConvInfo, Credentials, HistoryPage, JoinStart, Update};
 
 /// 断线后第一次重连前等多久；之后每次翻倍，最多 [`RECONNECT_MAX`]。
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
@@ -82,11 +84,18 @@ impl Client {
     /// `position` 是上次存下的同步位置（新电脑为空，从登录时的位置开始）。
     ///
     /// 返回后客户端在后台处理推送、断线重连与补拉，结果从 [`Updates`] 里取。
-    pub async fn connect(config: Config, mut creds: Credentials, cindy_token: Option<String>, position: Option<u64>) -> Result<(Self, Updates)> {
+    pub async fn connect(
+        config: Config,
+        mut creds: Credentials,
+        cindy_token: Option<String>,
+        position: Option<u64>,
+    ) -> Result<(Self, Updates)> {
         let ws = ws_url(&config.server);
         let auth = match (cindy_token, &creds.session) {
             (Some(token), _) => HelloAuth::Cindy { token },
-            (None, Some(session)) => HelloAuth::Session { token: session.clone() },
+            (None, Some(session)) => HelloAuth::Session {
+                token: session.clone(),
+            },
             (None, None) => return Err(ClientError::state("还没有登录凭证，需要先用 Cindy 登录")),
         };
         let connected = conn::connect(&ws, auth, &creds.device, &config.device_name).await?;
@@ -104,7 +113,9 @@ impl Client {
             creds.session = Some(session);
             let _ = updates.send(Update::CredentialsChanged);
         }
-        let _ = updates.send(Update::Connected { status: welcome.status });
+        let _ = updates.send(Update::Connected {
+            status: welcome.status,
+        });
         let device = creds.device.id();
         let base = http_base(&config.server);
         let state = State {
@@ -115,6 +126,7 @@ impl Client {
             epoch: welcome.epoch,
             status: welcome.status,
             reading: welcome.reading,
+            friend_requests: welcome.friend_requests,
             sync_head: welcome.sync_head,
             position,
             book: Book::default(),
@@ -161,7 +173,10 @@ impl Client {
     }
 
     /// 在状态锁里用当前连接执行一个操作。
-    pub(crate) async fn call<T>(&self, f: impl AsyncFnOnce(&mut State, &Conn) -> Result<T>) -> Result<T> {
+    pub(crate) async fn call<T>(
+        &self,
+        f: impl AsyncFnOnce(&mut State, &Conn) -> Result<T>,
+    ) -> Result<T> {
         let conn = self.inner.conn()?;
         let mut state = self.inner.state.lock().await;
         f(&mut state, &conn).await
@@ -231,7 +246,8 @@ impl Client {
 
     /// 移除别的电脑（契约 S5）。
     pub async fn remove_device(&self, device: &DeviceId) -> Result<()> {
-        self.call(async |s, c| s.remove_device(c, device).await).await
+        self.call(async |s, c| s.remove_device(c, device).await)
+            .await
     }
 
     /// 重新生成恢复密钥（契约 S6）。
@@ -258,7 +274,8 @@ impl Client {
 
     /// 新电脑：用恢复密钥加入（契约 S3）。
     pub async fn join_with_recovery(&self, recovery: &str) -> Result<()> {
-        self.call(async |s, c| s.join_with_recovery(c, recovery).await).await
+        self.call(async |s, c| s.join_with_recovery(c, recovery).await)
+            .await
     }
 
     /// 旧电脑：待处理的批准请求。
@@ -268,12 +285,14 @@ impl Client {
 
     /// 旧电脑：输入新电脑上的 4 个词。对上了自动批准；对不上会收到 [`Update::JoinRetry`]。
     pub async fn join_respond(&self, request: &RequestId, words: &str) -> Result<()> {
-        self.call(async |s, c| s.join_respond(c, request, words).await).await
+        self.call(async |s, c| s.join_respond(c, request, words).await)
+            .await
     }
 
     /// 旧电脑：拒绝。
     pub async fn join_reject(&self, request: &RequestId) -> Result<()> {
-        self.call(async |s, c| s.join_reject(c, request).await).await
+        self.call(async |s, c| s.join_reject(c, request).await)
+            .await
     }
 
     // ---------- 好友 ----------
@@ -285,7 +304,8 @@ impl Client {
 
     /// 按好友链接查对方并核对身份。
     pub async fn resolve_friend(&self, link: &FriendLink) -> Result<AccountInfo> {
-        self.call(async |s, c| s.resolve_friend(c, link).await).await
+        self.call(async |s, c| s.resolve_friend(c, link).await)
+            .await
     }
 
     /// 加好友（契约 S9），返回私聊。
@@ -295,7 +315,8 @@ impl Client {
 
     /// 重置账号之前就在、还记着旧身份的群：重置后已经用不了（契约 S7）。
     pub async fn groups_left_by_reset(&self) -> Result<Vec<ConvId>> {
-        self.call(async |s, c| s.groups_left_by_reset(c).await).await
+        self.call(async |s, c| s.groups_left_by_reset(c).await)
+            .await
     }
 
     /// 和群成员私聊（契约 S10），返回私聊。
@@ -312,27 +333,32 @@ impl Client {
 
     /// 新建群（契约 S11），返回群。
     pub async fn create_group(&self, profile: &GroupProfile, members: &[Uid]) -> Result<ConvId> {
-        self.call(async |s, c| s.create_group(c, profile, members).await).await
+        self.call(async |s, c| s.create_group(c, profile, members).await)
+            .await
     }
 
     /// 邀请成员（契约 S12）。
     pub async fn invite(&self, conv: &ConvId, members: &[Uid]) -> Result<()> {
-        self.call(async |s, c| s.invite(c, conv, members).await).await
+        self.call(async |s, c| s.invite(c, conv, members).await)
+            .await
     }
 
     /// 复制群邀请链接（契约 S12）。
     pub async fn create_invite_link(&self, conv: &ConvId) -> Result<InviteLink> {
-        self.call(async |s, c| s.create_invite_link(c, conv).await).await
+        self.call(async |s, c| s.create_invite_link(c, conv).await)
+            .await
     }
 
     /// 作废群邀请链接。
     pub async fn revoke_invite(&self, conv: &ConvId, invite: &InviteId) -> Result<()> {
-        self.call(async |s, c| s.revoke_invite(c, conv, invite).await).await
+        self.call(async |s, c| s.revoke_invite(c, conv, invite).await)
+            .await
     }
 
     /// 凭群邀请链接加入，返回群。
     pub async fn join_by_invite(&self, link: &InviteLink) -> Result<ConvId> {
-        self.call(async |s, c| s.join_by_invite(c, link).await).await
+        self.call(async |s, c| s.join_by_invite(c, link).await)
+            .await
     }
 
     /// 群主移出成员（契约 S13）。
@@ -347,7 +373,8 @@ impl Client {
 
     /// 改群资料。
     pub async fn set_group_profile(&self, conv: &ConvId, profile: &GroupProfile) -> Result<()> {
-        self.call(async |s, c| s.set_group_profile(c, conv, profile).await).await
+        self.call(async |s, c| s.set_group_profile(c, conv, profile).await)
+            .await
     }
 
     /// 群资料（私聊为空）。
@@ -367,7 +394,8 @@ impl Client {
 
     /// 换代（一般不用直接调：发消息时需要会自动换）。
     pub async fn rotate(&self, conv: &ConvId) -> Result<()> {
-        self.call(async |s, c| s.rotate(c, conv, Vec::new()).await).await
+        self.call(async |s, c| s.rotate(c, conv, Vec::new()).await)
+            .await
     }
 
     // ---------- 消息 ----------
@@ -375,23 +403,47 @@ impl Client {
     /// 发消息，返回（日志序号，服务器时间）。同一次发送重试时用同一个 `id`。
     pub async fn send(&self, conv: &ConvId, id: &MsgId, content: Content) -> Result<(u64, i64)> {
         let lan = self.inner.lan.clone();
-        self.call(async move |s, c| s.send(c, conv, id, content, &lan).await).await
+        self.call(async move |s, c| s.send(c, conv, id, content, &lan).await)
+            .await
     }
 
     /// 撤回自己的一条消息。
     pub async fn recall(&self, conv: &ConvId, id: &MsgId, target: &MsgId) -> Result<(u64, i64)> {
-        self.send(conv, id, Content::Recall { target: target.clone() }).await
+        self.send(
+            conv,
+            id,
+            Content::Recall {
+                target: target.clone(),
+            },
+        )
+        .await
     }
 
     /// 往前翻一页历史（`before` 为空从最新开始）。
-    pub async fn history(&self, conv: &ConvId, before: Option<u64>, limit: u32) -> Result<HistoryPage> {
+    pub async fn history(
+        &self,
+        conv: &ConvId,
+        before: Option<u64>,
+        limit: u32,
+    ) -> Result<HistoryPage> {
         self.history_in(conv, before, limit, None, None).await
     }
 
     /// 同 [`Client::history`]，只要服务器时间在 `since_ms`～`until_ms` 之间的（毫秒，两端都含，可以只给一端）。
     /// 系统提示没有服务器时间，按签它的人写的时间筛。
-    pub async fn history_in(&self, conv: &ConvId, before: Option<u64>, limit: u32, since_ms: Option<i64>, until_ms: Option<i64>) -> Result<HistoryPage> {
-        self.call(async |s, c| s.history(c, conv, before, limit, (since_ms, until_ms)).await).await
+    pub async fn history_in(
+        &self,
+        conv: &ConvId,
+        before: Option<u64>,
+        limit: u32,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+    ) -> Result<HistoryPage> {
+        self.call(async |s, c| {
+            s.history(c, conv, before, limit, (since_ms, until_ms))
+                .await
+        })
+        .await
     }
 
     /// 会话活动：自己所在的会话里 `since_ms` 起有消息的，每个会话最早、最新一条的服务器时间，按最新的从新到旧。
@@ -401,7 +453,14 @@ impl Client {
     }
 
     /// 文件、图片：见 [`crate::files`]。
-    pub async fn upload(&self, conv: &ConvId, reader: impl std::io::Read, size: u64, name: &str, mime: &str) -> Result<FileRef> {
+    pub async fn upload(
+        &self,
+        conv: &ConvId,
+        reader: impl std::io::Read,
+        size: u64,
+        name: &str,
+        mime: &str,
+    ) -> Result<FileRef> {
         crate::files::upload(self, conv, reader, size, name, mime).await
     }
 
@@ -418,12 +477,18 @@ impl Client {
 }
 
 /// 后台：处理推送；断了就重连、补拉，直到停止。
-async fn supervise(inner: Arc<Inner>, mut pushes: mpsc::Receiver<Push>, mut direct: mpsc::UnboundedReceiver<DirectInbound>) {
+async fn supervise(
+    inner: Arc<Inner>,
+    mut pushes: mpsc::Receiver<Push>,
+    mut direct: mpsc::UnboundedReceiver<DirectInbound>,
+) {
     // 局域网直连没起来（`Lan::disabled`）时发送端已经扔了：通道一关就不再等它，否则 `recv` 每次立刻回 `None`，循环空转占满一个核。
     let mut direct_open = true;
     loop {
         // 这一轮连接自己的对象：连接关了也要把它推来的东西处理完——服务器移除电脑时先推“已被移出”再关连接。
-        let Some(conn) = inner.conn.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return };
+        let Some(conn) = inner.conn.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+            return;
+        };
         if !conn.is_closed() {
             let mut state = inner.state.lock().await;
             if let Err(error) = state.catch_up(&conn).await {
@@ -465,9 +530,18 @@ async fn supervise(inner: Arc<Inner>, mut pushes: mpsc::Receiver<Push>, mut dire
             }
             match reconnect(&inner).await {
                 Ok(next) => break next,
-                Err(ClientError::Server(error)) if matches!(error.code, ErrorCode::Unauthorized | ErrorCode::DeviceRemoved) => {
+                Err(ClientError::Server(error))
+                    if matches!(
+                        error.code,
+                        ErrorCode::Unauthorized | ErrorCode::DeviceRemoved
+                    ) =>
+                {
                     tracing::info!(code = ?error.code, "登录凭证失效或电脑已被移除，停止重连");
-                    let update = if error.code == ErrorCode::DeviceRemoved { Update::DeviceRemoved } else { Update::LoggedOut };
+                    let update = if error.code == ErrorCode::DeviceRemoved {
+                        Update::DeviceRemoved
+                    } else {
+                        Update::LoggedOut
+                    };
                     inner.state.lock().await.emit(update);
                     inner.stop();
                     return;
@@ -484,10 +558,20 @@ async fn supervise(inner: Arc<Inner>, mut pushes: mpsc::Receiver<Push>, mut dire
 async fn reconnect(inner: &Arc<Inner>) -> Result<mpsc::Receiver<Push>> {
     let (device, session, name) = {
         let state = inner.state.lock().await;
-        (state.creds.device.clone(), state.creds.session.clone(), state.config.device_name.clone())
+        (
+            state.creds.device.clone(),
+            state.creds.session.clone(),
+            state.config.device_name.clone(),
+        )
     };
     let session = session.ok_or_else(|| ClientError::state("没有登录凭证"))?;
-    let connected = conn::connect(&inner.ws, HelloAuth::Session { token: session }, &device, &name).await?;
+    let connected = conn::connect(
+        &inner.ws,
+        HelloAuth::Session { token: session },
+        &device,
+        &name,
+    )
+    .await?;
     let welcome = connected.welcome;
     let mut state = inner.state.lock().await;
     let was_active = state.status == DeviceStatus::Active;
@@ -498,6 +582,7 @@ async fn reconnect(inner: &Arc<Inner>) -> Result<mpsc::Receiver<Push>> {
     }
     state.status = welcome.status;
     state.reading = welcome.reading;
+    state.friend_requests = welcome.friend_requests;
     state.sync_head = welcome.sync_head;
     state.epoch = welcome.epoch;
     state.clock = connected.clock;
@@ -523,7 +608,9 @@ async fn reconnect(inner: &Arc<Inner>) -> Result<mpsc::Receiver<Push>> {
         inner.set_conn(None);
         return Err(error);
     }
-    state.emit(Update::Connected { status: welcome.status });
+    state.emit(Update::Connected {
+        status: welcome.status,
+    });
     tracing::info!("已重连");
     Ok(connected.pushes)
 }

@@ -12,7 +12,8 @@ use friend_im_core::keys::ConvSeed;
 use friend_im_core::limits;
 use friend_im_core::pake::{ApproverHandshake, NewDeviceHandshake};
 use friend_im_core::wire::{
-    AccountKeyBundle, DeviceKeyBox, DeviceStatus, Event, JoinCloseReason, JoinRequestInfo, Push, Request, Response, StoredMessage, SyncEvent,
+    AccountKeyBundle, DeviceKeyBox, DeviceStatus, Event, JoinCloseReason, JoinRequestInfo, Push,
+    Request, Response, StoredMessage, SyncEvent,
 };
 use friend_im_core::words::JoinCode;
 use friend_im_core::{crypto, keys};
@@ -55,6 +56,7 @@ pub(crate) struct State {
     pub epoch: u32,
     pub status: DeviceStatus,
     pub reading: bool,
+    pub friend_requests: bool,
     /// 当前连接登录时服务器的日志序号：新电脑从这里开始同步。
     pub sync_head: u64,
     /// 处理到的日志序号。
@@ -91,7 +93,9 @@ pub(crate) struct ServerClock {
 impl ServerClock {
     /// 服务器第一帧里的时间，与收到它时本机的时间（都是毫秒）。
     pub(crate) fn from_challenge(server_ms: i64, local_ms: i64) -> Self {
-        Self { offset_ms: server_ms.saturating_sub(local_ms) }
+        Self {
+            offset_ms: server_ms.saturating_sub(local_ms),
+        }
     }
 
     /// 按服务器的钟，现在是几点（毫秒）。
@@ -136,10 +140,19 @@ impl State {
 
     /// 自己账号当前一轮的签名链（缓存里没有就取）。
     pub async fn me(&mut self, conn: &Conn) -> Result<AccountState> {
-        if self.book.current(&self.uid).is_none_or(|s| s.epoch != self.epoch) {
-            self.book.load_account(conn, &self.uid, Some(self.epoch)).await?;
+        if self
+            .book
+            .current(&self.uid)
+            .is_none_or(|s| s.epoch != self.epoch)
+        {
+            self.book
+                .load_account(conn, &self.uid, Some(self.epoch))
+                .await?;
         }
-        self.book.current(&self.uid).cloned().ok_or_else(|| ClientError::state("账号还没开通"))
+        self.book
+            .current(&self.uid)
+            .cloned()
+            .ok_or_else(|| ClientError::state("账号还没开通"))
     }
 
     /// 自己的成员身份（账号 + 当前身份指纹）。
@@ -153,53 +166,86 @@ impl State {
 
     /// 取封装给这台电脑的账号钥匙（全部代）。
     pub async fn load_account_keys(&mut self, conn: &Conn) -> Result<()> {
-        self.book.load_account(conn, &self.uid, Some(self.epoch)).await?;
-        let Response::AccountKeys { epoch, boxes, prev } = conn.request(Request::GetAccountKeys).await? else {
+        self.book
+            .load_account(conn, &self.uid, Some(self.epoch))
+            .await?;
+        let Response::AccountKeys { epoch, boxes, prev } =
+            conn.request(Request::GetAccountKeys).await?
+        else {
             return Err(ClientError::protocol("取账号钥匙的回执不对"));
         };
         if epoch != self.epoch {
             return Err(ClientError::state("账号已经在别处重置"));
         }
         let state = self.me(conn).await?;
-        self.keys.open_account_keys(&self.creds.device, &state, &boxes, &prev)
+        self.keys
+            .open_account_keys(&self.creds.device, &state, &boxes, &prev)
     }
 
     /// 保证手里有账号钥匙的当前一代。
     pub async fn ensure_account_keys(&mut self, conn: &Conn) -> Result<AccountState> {
         let state = self.me(conn).await?;
-        if self.keys.account_seed(state.epoch, state.current_key().generation).is_none() {
+        if self
+            .keys
+            .account_seed(state.epoch, state.current_key().generation)
+            .is_none()
+        {
             self.load_account_keys(conn).await?;
         }
         self.me(conn).await
     }
 
     /// 某会话某一代的钥匙：缓存里没有就向服务器取封装给我的、解开并核对。
-    pub async fn conv_seed(&mut self, conn: &Conn, conv: &ConvId, generation: u32) -> Result<ConvSeed> {
+    pub async fn conv_seed(
+        &mut self,
+        conn: &Conn,
+        conv: &ConvId,
+        generation: u32,
+    ) -> Result<ConvSeed> {
         self.optional_conv_seed(conn, conv, generation)
             .await?
             .ok_or_else(|| ClientError::verify(format!("拿不到第 {generation} 代会话钥匙")))
     }
 
     /// 旧身份或入群前的钥匙可以不存在；验签、解封或协议错误仍然向上传递。
-    pub async fn optional_conv_seed(&mut self, conn: &Conn, conv: &ConvId, generation: u32) -> Result<Option<ConvSeed>> {
+    pub async fn optional_conv_seed(
+        &mut self,
+        conn: &Conn,
+        conv: &ConvId,
+        generation: u32,
+    ) -> Result<Option<ConvSeed>> {
         if let Some(seed) = self.keys.conv_seed(conv, generation) {
             return Ok(Some(seed));
         }
-        if self.book.conv(conn, conv).await?.state.key(generation).is_none() {
+        if self
+            .book
+            .conv(conn, conv)
+            .await?
+            .state
+            .key(generation)
+            .is_none()
+        {
             self.book.load_conv(conn, conv).await?;
         }
         let state = self.book.conv(conn, conv).await?.state.clone();
         if state.key(generation).is_none() {
             return Err(ClientError::verify("会话签名链里没有这一代钥匙"));
         }
-        let Response::ConvKeys { boxes, prev, .. } = conn.request(Request::GetConvKeys { conv: conv.clone() }).await? else {
+        let Response::ConvKeys { boxes, prev, .. } = conn
+            .request(Request::GetConvKeys { conv: conv.clone() })
+            .await?
+        else {
             return Err(ClientError::protocol("取会话钥匙的回执不对"));
         };
         // 封装给了我账号钥匙更新的一代（别的电脑刚换过代）：先把账号钥匙取全。
         let me = self.me(conn).await?;
-        let newer = boxes
-            .iter()
-            .any(|b| b.account_epoch == me.epoch && self.keys.account_seed(b.account_epoch, b.account_generation).is_none());
+        let newer = boxes.iter().any(|b| {
+            b.account_epoch == me.epoch
+                && self
+                    .keys
+                    .account_seed(b.account_epoch, b.account_generation)
+                    .is_none()
+        });
         if newer {
             self.load_account_keys(conn).await?;
         }
@@ -208,7 +254,13 @@ impl State {
     }
 
     /// 把账号钥匙某一代封装给一台电脑（或恢复密钥）。
-    pub fn seal_account_seed(&self, epoch: u32, generation: u32, seed: &keys::AccountSeed, to: &keys::DevicePublic) -> Result<DeviceKeyBox> {
+    pub fn seal_account_seed(
+        &self,
+        epoch: u32,
+        generation: u32,
+        seed: &keys::AccountSeed,
+        to: &keys::DevicePublic,
+    ) -> Result<DeviceKeyBox> {
         let info = keys::account_seed_info(&self.uid, epoch, generation, &to.id());
         Ok(DeviceKeyBox {
             device: to.id(),
@@ -217,7 +269,12 @@ impl State {
     }
 
     /// 账号钥匙换一代：封装给账号现在的全部电脑和恢复密钥，带上一代的旧钥匙链。`state` 是接上新一环之后的现状。
-    pub fn account_bundle(&self, state: &AccountState, seed: &keys::AccountSeed, previous: &keys::AccountSeed) -> Result<AccountKeyBundle> {
+    pub fn account_bundle(
+        &self,
+        state: &AccountState,
+        seed: &keys::AccountSeed,
+        previous: &keys::AccountSeed,
+    ) -> Result<AccountKeyBundle> {
         let generation = state.current_key().generation;
         let mut boxes = Vec::new();
         for (_, record) in state.active_devices() {
@@ -297,7 +354,9 @@ impl State {
             Event::ConvLink { conv, link } => self.on_conv_link(conn, &conv, &link, log).await,
             // 会话钥匙按需取，新封装不用当场处理。
             Event::ConvKeys { .. } => {}
-            Event::AccountLink { uid, epoch, link } => self.on_account_link(conn, &uid, epoch, &link, log).await,
+            Event::AccountLink { uid, epoch, link } => {
+                self.on_account_link(conn, &uid, epoch, &link, log).await
+            }
         }
         self.position = Some(log);
     }
@@ -310,7 +369,12 @@ impl State {
         }
         let id = direct.env.id.clone();
         self.remember_message(&id);
-        let msg = StoredMessage { log: direct.log, ts_ms: direct.ts_ms, env: direct.env, recalled: false };
+        let msg = StoredMessage {
+            log: direct.log,
+            ts_ms: direct.ts_ms,
+            env: direct.env,
+            recalled: false,
+        };
         match self.open_message(conn, &msg).await {
             Ok(message) => self.emit(Update::Message(message)),
             Err(error) => {
@@ -333,12 +397,20 @@ impl State {
         if self.seen_messages.insert(id.clone()) {
             self.seen_order.push_back(id.clone());
             while self.seen_order.len() > 8192 {
-                if let Some(old) = self.seen_order.pop_front() { self.seen_messages.remove(&old); }
+                if let Some(old) = self.seen_order.pop_front() {
+                    self.seen_messages.remove(&old);
+                }
             }
         }
     }
 
-    async fn on_conv_link(&mut self, conn: &Conn, conv: &ConvId, link: &friend_im_core::conv::ConvLink, log: u64) {
+    async fn on_conv_link(
+        &mut self,
+        conn: &Conn,
+        conv: &ConvId,
+        link: &friend_im_core::conv::ConvLink,
+        log: u64,
+    ) {
         let result = self.accept_link_event(conn, conv, link, log).await;
         match result {
             Ok(()) => {
@@ -347,7 +419,9 @@ impl State {
                     self.emit(Update::Conv(notice));
                 }
             }
-            Err(ClientError::Disconnected) => tracing::info!(conv = %conv, log, "连接断了，会话签名链这一环重连后补拉"),
+            Err(ClientError::Disconnected) => {
+                tracing::info!(conv = %conv, log, "连接断了，会话签名链这一环重连后补拉")
+            }
             Err(error) => {
                 tracing::warn!(conv = %conv, log, %error, "会话签名链验不过");
                 self.emit(Update::ConvRejected {
@@ -359,20 +433,41 @@ impl State {
         }
     }
 
-    async fn accept_link_event(&mut self, conn: &Conn, conv: &ConvId, link: &friend_im_core::conv::ConvLink, log: u64) -> Result<()> {
-        let body = link.parse().map_err(|e| ClientError::verify(format!("会话签名链：{e}")))?;
+    async fn accept_link_event(
+        &mut self,
+        conn: &Conn,
+        conv: &ConvId,
+        link: &friend_im_core::conv::ConvLink,
+        log: u64,
+    ) -> Result<()> {
+        let body = link
+            .parse()
+            .map_err(|e| ClientError::verify(format!("会话签名链：{e}")))?;
         let next = self.book.convs.get(conv).map(|r| r.state.seq + 1);
         match next {
             // 已经接过（自己刚做的操作，或补取时已接上）：核对是同一环。
             Some(next) if body.seq < next => {
-                let same = self.book.convs[conv].links.iter().any(|(l, lg)| *lg == log && l.hash() == link.hash());
-                if same { Ok(()) } else { Err(ClientError::verify("服务器给的会话签名链前后不一致")) }
+                let same = self.book.convs[conv]
+                    .links
+                    .iter()
+                    .any(|(l, lg)| *lg == log && l.hash() == link.hash());
+                if same {
+                    Ok(())
+                } else {
+                    Err(ClientError::verify("服务器给的会话签名链前后不一致"))
+                }
             }
-            Some(next) if body.seq == next => self.book.accept_conv_link(conn, conv, link, log).await,
+            Some(next) if body.seq == next => {
+                self.book.accept_conv_link(conn, conv, link, log).await
+            }
             _ => {
                 self.book.load_conv(conn, conv).await?;
                 let record = &self.book.convs[conv];
-                if record.links.iter().any(|(l, lg)| *lg == log && l.hash() == link.hash()) {
+                if record
+                    .links
+                    .iter()
+                    .any(|(l, lg)| *lg == log && l.hash() == link.hash())
+                {
                     Ok(())
                 } else {
                     Err(ClientError::verify("推送的一环不在服务器给的会话签名链里"))
@@ -382,7 +477,12 @@ impl State {
     }
 
     /// 系统提示之后要顺手做的事：凭邀请加入的人只拿到发邀请时那一代钥匙，群已经换过代就补发当前一代（谁先补上算谁的）。
-    async fn after_conv_notice(&mut self, conn: &Conn, notice: &Notice, link: &friend_im_core::conv::ConvLink) {
+    async fn after_conv_notice(
+        &mut self,
+        conn: &Conn,
+        notice: &Notice,
+        link: &friend_im_core::conv::ConvLink,
+    ) {
         use friend_im_core::conv::ConvChange;
         let Ok(body) = link.parse() else { return };
         let ConvChange::JoinByInvite { member, invite, .. } = &body.change else {
@@ -391,9 +491,16 @@ impl State {
         if member.uid == self.uid {
             return;
         }
-        let Some(record) = self.book.convs.get(&notice.conv) else { return };
+        let Some(record) = self.book.convs.get(&notice.conv) else {
+            return;
+        };
         let current = record.state.current_key().generation;
-        if record.invite_generations.get(invite).is_none_or(|g| *g >= current) || !record.state.members.contains_key(&self.uid) {
+        if record
+            .invite_generations
+            .get(invite)
+            .is_none_or(|g| *g >= current)
+            || !record.state.members.contains_key(&self.uid)
+        {
             return;
         }
         let member = member.clone();
@@ -402,18 +509,44 @@ impl State {
         }
     }
 
-    async fn grant(&mut self, conn: &Conn, conv: &ConvId, member: &MemberRef, generation: u32) -> Result<()> {
+    async fn grant(
+        &mut self,
+        conn: &Conn,
+        conv: &ConvId,
+        member: &MemberRef,
+        generation: u32,
+    ) -> Result<()> {
         let seed = self.conv_seed(conn, conv, generation).await?;
-        let boxes = self.seal_to_members(conn, conv, generation, &seed, std::slice::from_ref(member), true).await?;
+        let boxes = self
+            .seal_to_members(
+                conn,
+                conv,
+                generation,
+                &seed,
+                std::slice::from_ref(member),
+                true,
+            )
+            .await?;
         conn.request(Request::GrantConvKeys {
             conv: conv.clone(),
-            keys: friend_im_core::wire::ConvKeyBundle { generation, boxes, prev: None },
+            keys: friend_im_core::wire::ConvKeyBundle {
+                generation,
+                boxes,
+                prev: None,
+            },
         })
         .await?;
         Ok(())
     }
 
-    async fn on_account_link(&mut self, conn: &Conn, uid: &Uid, epoch: u32, link: &friend_im_core::account::AccountLink, log: u64) {
+    async fn on_account_link(
+        &mut self,
+        conn: &Conn,
+        uid: &Uid,
+        epoch: u32,
+        link: &friend_im_core::account::AccountLink,
+        log: u64,
+    ) {
         let Ok(body) = link.parse() else {
             tracing::warn!(uid = %uid, "账号签名链的一环读不懂");
             return;
@@ -452,17 +585,27 @@ impl State {
             // 自己的账号钥匙换了代（别的电脑做的）：把新一代取回来。
             let rotated = matches!(
                 body.change,
-                AccountChange::RemoveDevice { key: Some(_), .. } | AccountChange::RotateKey { .. } | AccountChange::ReplaceRecovery { .. }
+                AccountChange::RemoveDevice { key: Some(_), .. }
+                    | AccountChange::RotateKey { .. }
+                    | AccountChange::ReplaceRecovery { .. }
             );
             let removed_me = matches!(&body.change, AccountChange::RemoveDevice { device, .. } if device == &self.creds.device.id());
             // 别的电脑退出了自己、没有换代：在线的电脑当场补换一代，退出的那台拿着的旧代读不到之后的消息。
             // 几台电脑同时补换时只有一台成功，其余的被服务器拒绝，不影响。
-            let left_without_rotation = matches!(&body.change, AccountChange::RemoveDevice { key: None, .. }) && !removed_me;
-            if rotated && !removed_me && let Err(error) = self.ensure_account_keys(conn).await {
+            let left_without_rotation =
+                matches!(&body.change, AccountChange::RemoveDevice { key: None, .. })
+                    && !removed_me;
+            if rotated
+                && !removed_me
+                && let Err(error) = self.ensure_account_keys(conn).await
+            {
                 tracing::warn!(%error, "取新一代账号钥匙失败");
             }
             if left_without_rotation
-                && self.book.current(&self.uid).is_some_and(|s| s.rotation_pending)
+                && self
+                    .book
+                    .current(&self.uid)
+                    .is_some_and(|s| s.rotation_pending)
                 && let Err(error) = self.rotate_account_key(conn).await
             {
                 tracing::info!(%error, "补换账号钥匙没成（可能别的电脑已经换了）");
@@ -494,7 +637,10 @@ impl State {
         if msg.recalled || env.ct.is_empty() {
             return Ok(message);
         }
-        let stale = self.book.convs.get(&env.conv).is_none_or(|r| r.state.key(env.generation).is_none() || !r.member_at(&env.sender, &env.sender_eldest, msg.log));
+        let stale = self.book.convs.get(&env.conv).is_none_or(|r| {
+            r.state.key(env.generation).is_none()
+                || !r.member_at(&env.sender, &env.sender_eldest, msg.log)
+        });
         if stale {
             self.book.load_conv(conn, &env.conv).await?;
         }
@@ -502,7 +648,10 @@ impl State {
         if !record.member_at(&env.sender, &env.sender_eldest, msg.log) {
             return Err(ClientError::verify("发送的人当时不在这个会话里"));
         }
-        let device = self.book.ensure_device(conn, &env.sender, &env.sender_eldest, &env.device, msg.log).await?;
+        let device = self
+            .book
+            .ensure_device(conn, &env.sender, &env.sender_eldest, &env.device, msg.log)
+            .await?;
         let seed = self.conv_seed(conn, &env.conv, env.generation).await?;
         let body = env.open(&seed, &device)?;
         message.ctime_ms = body.ctime_ms;
@@ -516,6 +665,7 @@ impl State {
     pub async fn handle_push(&mut self, conn: &Conn, push: Push) -> Flow {
         match push {
             Push::ReadingChanged { conv } => self.emit(Update::ReadingChanged { conv }),
+            Push::FriendRequestsChanged => self.emit(Update::FriendRequestsChanged),
             Push::Event { event } => {
                 let log = event.log;
                 self.process_event(conn, event).await;
@@ -524,10 +674,15 @@ impl State {
                 }
             }
             Push::JoinRequested { request } => {
-                self.requests.insert(request.request.clone(), request.clone());
+                self.requests
+                    .insert(request.request.clone(), request.clone());
                 self.emit(Update::JoinRequested(request));
             }
-            Push::JoinRetry { request, attempt, pake } => {
+            Push::JoinRetry {
+                request,
+                attempt,
+                pake,
+            } => {
                 self.approvals.remove(&request);
                 if let Some(info) = self.requests.get_mut(&request) {
                     info.attempt = attempt;
@@ -541,12 +696,22 @@ impl State {
                 pake,
                 confirm,
             } => {
-                if let Err(error) = self.on_join_answered(conn, &request, attempt, &pake, &confirm).await {
+                if let Err(error) = self
+                    .on_join_answered(conn, &request, attempt, &pake, &confirm)
+                    .await
+                {
                     tracing::warn!(%error, "处理旧电脑的回应失败");
                 }
             }
-            Push::JoinConfirmed { request, attempt, confirm } => {
-                if let Err(error) = self.on_join_confirmed(conn, &request, attempt, &confirm).await {
+            Push::JoinConfirmed {
+                request,
+                attempt,
+                confirm,
+            } => {
+                if let Err(error) = self
+                    .on_join_confirmed(conn, &request, attempt, &confirm)
+                    .await
+                {
                     tracing::warn!(%error, "批准新电脑失败");
                 }
             }

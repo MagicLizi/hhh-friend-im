@@ -107,7 +107,10 @@ impl Lan {
     ) -> std::io::Result<Arc<Self>> {
         // WASI 构建（手机上由宿主解释执行）不做局域网直连：没有组播，也不在手机上开监听端口；调用方照原有设计改走服务器中转。
         if cfg!(target_os = "wasi") {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "WASI 构建不做局域网直连"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "WASI 构建不做局域网直连",
+            ));
         }
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
         let port = listener.local_addr()?.port();
@@ -317,11 +320,18 @@ impl Lan {
                 if let Some(pending) =
                     pending.filter(|p| Instant::now().duration_since(p.created) <= PENDING_TTL)
                 {
-                    let _ = inbound.send(DirectInbound {
-                        env: pending.env,
-                        log,
-                        ts_ms,
-                    });
+                    inbound
+                        .send(DirectInbound {
+                            env: pending.env,
+                            log,
+                            ts_ms,
+                        })
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "receiving client has stopped",
+                            )
+                        })?;
                     write_frame(&mut writer, &Frame::Delivered { id }).await?;
                 } else {
                     write_frame(
@@ -537,5 +547,22 @@ mod tests {
             .unwrap();
         assert_eq!(incoming.env, env);
         assert_eq!((incoming.log, incoming.ts_ms), (42, 99));
+        // A stopped client must not acknowledge delivery and suppress server fallback.
+        drop(rx);
+        let mut after_close = env;
+        after_close.id = MsgId::random();
+        let ready = sender
+            .offer(
+                &after_close,
+                std::slice::from_ref(&receiver_uid),
+                std::slice::from_ref(&receiver.device),
+            )
+            .await;
+        assert!(
+            sender
+                .commit(&after_close.id, 43, 100, &ready)
+                .await
+                .is_empty()
+        );
     }
 }

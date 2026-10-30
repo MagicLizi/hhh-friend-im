@@ -44,7 +44,11 @@ pub(crate) struct Outbox {
 
 impl Outbox {
     pub(crate) fn push(&self, event: Event) {
-        self.queue.lock().expect("推送队列锁中毒").0.push_back(event);
+        self.queue
+            .lock()
+            .expect("推送队列锁中毒")
+            .0
+            .push_back(event);
         self.wake.notify_one();
     }
 
@@ -60,7 +64,12 @@ impl Outbox {
         let mut queue = self.queue.lock().expect("推送队列锁中毒");
         let n = queue.0.len().min(BATCH_MAX);
         let events: Vec<Event> = queue.0.drain(..n).collect();
-        let position = queue.0.is_empty().then_some(queue.1).flatten().filter(|p| sent.is_none_or(|s| *p > s));
+        let position = queue
+            .0
+            .is_empty()
+            .then_some(queue.1)
+            .flatten()
+            .filter(|p| sent.is_none_or(|s| *p > s));
         (!events.is_empty() || position.is_some()).then_some((events, position))
     }
 }
@@ -82,10 +91,17 @@ async fn send_batches(server: Arc<Server>, outbox: Arc<Outbox>) {
     loop {
         outbox.wake.notified().await;
         while let Some((events, position)) = outbox.take(sent) {
-            let params = EventsPushParams { events, sync_state: position.map(|p| p.to_string()) };
+            let params = EventsPushParams {
+                events,
+                sync_state: position.map(|p| p.to_string()),
+            };
             let mut delay = server.options.push_retry;
             while let Err(error) = server.peer.request("events/push", &params).await {
-                tracing::warn!(?error, count = params.events.len(), "宿主没收下这批推送，稍后重推");
+                tracing::warn!(
+                    ?error,
+                    count = params.events.len(),
+                    "宿主没收下这批推送，稍后重推"
+                );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(30));
             }
@@ -101,6 +117,16 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
     let outbox = live.outbox.clone();
     while let Some(update) = updates.recv().await {
         match update {
+            Update::FriendRequestsChanged => {
+                if server
+                    .friend_events
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    server
+                        .peer
+                        .notify("contacts/requestsChanged", serde_json::json!({}));
+                }
+            }
             Update::ReadingChanged { conv } => {
                 if server
                     .reading_events
@@ -123,7 +149,13 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
                 }
             }
             Update::Connected { status } => {
-                server.peer.notify("status", StatusParams { state: ConnState::Online, reason: None });
+                server.peer.notify(
+                    "status",
+                    StatusParams {
+                        state: ConnState::Online,
+                        reason: None,
+                    },
+                );
                 if status != DeviceStatus::Active {
                     tracing::warn!(?status, "重连后这台电脑不能用了");
                 }
@@ -131,20 +163,40 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
                 tokio::spawn(async move { drop_groups_left_by_reset(&live).await });
             }
             Update::Disconnected => {
-                server.peer.notify("status", StatusParams { state: ConnState::Connecting, reason: Some("和 Cindy IM 服务器断开了，正在重连".into()) });
+                server.peer.notify(
+                    "status",
+                    StatusParams {
+                        state: ConnState::Connecting,
+                        reason: Some("和 Cindy IM 服务器断开了，正在重连".into()),
+                    },
+                );
             }
             Update::Position(log) => outbox.position(log),
             Update::Message(message) => on_message(&live, &outbox, message).await,
-            Update::MessageRejected { conv, id, ts_ms, sender, .. } => {
+            Update::MessageRejected {
+                conv,
+                id,
+                ts_ms,
+                sender,
+                ..
+            } => {
                 ensure_conversation(&live, &outbox, &conv).await;
                 let names = live.names([sender.clone()]).await;
                 let wire = translate::unreadable(conv.as_str(), &id, &sender, ts_ms, &names);
-                outbox.push(Event::Messages { conversation_id: conv.to_string(), messages: vec![wire] });
+                outbox.push(Event::Messages {
+                    conversation_id: conv.to_string(),
+                    messages: vec![wire],
+                });
             }
             Update::Conv(notice) => {
                 // 刚进的会话：发一条个人资料；以前待过、这次是回来的，补推不在的那段（都在后台做，不挡推送）。
                 if joined(&live.me, &notice) {
-                    let (server, live, conv, log) = (server.clone(), live.clone(), notice.conv.clone(), notice.log);
+                    let (server, live, conv, log) = (
+                        server.clone(),
+                        live.clone(),
+                        notice.conv.clone(),
+                        notice.log,
+                    );
                     tokio::spawn(async move {
                         server.announce_to(&live, &conv).await;
                         backfill_rejoined(&live, &conv, log).await;
@@ -155,30 +207,51 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
             Update::ConvRejected { conv, log, reason } => {
                 tracing::warn!(%conv, log, %reason, "会话签名链有一环没通过核对，已拒绝");
                 let at = crate::server::now_ms();
-                outbox.push(Event::Messages { conversation_id: conv.to_string(), messages: vec![translate::conv_rejected(conv.as_str(), log, at)] });
+                outbox.push(Event::Messages {
+                    conversation_id: conv.to_string(),
+                    messages: vec![translate::conv_rejected(conv.as_str(), log, at)],
+                });
             }
             Update::CredentialsChanged => save_credentials(&server, &live).await,
             Update::DeviceRemoved => {
-                expire(&server, ReauthReason::Revoked, "这台电脑已被移出你的 Cindy IM 账号，要重新登录。").await;
+                expire(
+                    &server,
+                    ReauthReason::Revoked,
+                    "这台电脑已被移出你的 Cindy IM 账号，要重新登录。",
+                )
+                .await;
                 return;
             }
             Update::LoggedOut => {
-                expire(&server, ReauthReason::Expired, "Cindy IM 的登录已失效，要重新登录。").await;
+                expire(
+                    &server,
+                    ReauthReason::Expired,
+                    "Cindy IM 的登录已失效，要重新登录。",
+                )
+                .await;
                 return;
             }
             Update::Account { uid, notice, .. } if uid == live.me => match notice {
-                AccountNotice::DeviceAdded { name, device } if device != *live.client.device_id() => {
+                AccountNotice::DeviceAdded { name, device }
+                    if device != *live.client.device_id() =>
+                {
                     server.device_changed(&live, format!("你的账号新增了电脑「{name}」"));
                 }
-                AccountNotice::DeviceRemoved { name, .. } => server.device_changed(&live, format!("已移除电脑「{name}」")),
+                AccountNotice::DeviceRemoved { name, .. } => {
+                    server.device_changed(&live, format!("已移除电脑「{name}」"))
+                }
                 _ => {}
             },
             // 聊过的人重置账号：会话里的系统提示另外推来（MemberReset），这里不用管。
             Update::Account { .. } | Update::Activated | Update::JoinWrongCode { .. } => {}
             Update::JoinRequested(info) => server.join_requested(&live, info),
             Update::JoinRequests(requests) => server.requests_refreshed(&live, requests),
-            Update::JoinApproved { request } => server.flows.send_to_action(Input::Join(JoinEvent::Approved { request })),
-            Update::JoinRetry { request, attempt } => server.flows.send_to_action(Input::Join(JoinEvent::Retry { request, attempt })),
+            Update::JoinApproved { request } => server
+                .flows
+                .send_to_action(Input::Join(JoinEvent::Approved { request })),
+            Update::JoinRetry { request, attempt } => server
+                .flows
+                .send_to_action(Input::Join(JoinEvent::Retry { request, attempt })),
             Update::JoinClosed { request, reason } => server.join_closed(&live, request, reason),
         }
     }
@@ -210,7 +283,10 @@ async fn on_message(live: &Live, outbox: &Outbox, message: Message) {
     ensure_conversation(live, outbox, &message.conv).await;
     if let Some(Content::Recall { target }) = &message.content {
         if let Some(wire) = recalled(live, &message, target).await {
-            outbox.push(Event::Messages { conversation_id: message.conv.to_string(), messages: vec![wire] });
+            outbox.push(Event::Messages {
+                conversation_id: message.conv.to_string(),
+                messages: vec![wire],
+            });
         }
         return;
     }
@@ -219,7 +295,10 @@ async fn on_message(live: &Live, outbox: &Outbox, message: Message) {
         return;
     };
     live.remember(&wire.id, &message.sender, message.ts_ms);
-    outbox.push(Event::Messages { conversation_id: message.conv.to_string(), messages: vec![wire] });
+    outbox.push(Event::Messages {
+        conversation_id: message.conv.to_string(),
+        messages: vec![wire],
+    });
 }
 
 /// 见到一份个人资料（推来的或翻历史翻到的，头像键见 `profile::profile_key`）：比记下的新、头像变了就推这个人与
@@ -242,8 +321,16 @@ pub(crate) async fn me_changed(live: &Live) {
 
 async fn push_person(live: &Live, uid: &Uid) {
     let names = live.names([uid.clone()]).await;
-    let person = Person { id: uid.to_string(), id_type: None, kind: PersonKind::User, name: names.get(uid).cloned(), avatar: live.avatar_of(uid) };
-    live.outbox.push(Event::People { people: vec![person] });
+    let person = Person {
+        id: uid.to_string(),
+        id_type: None,
+        kind: PersonKind::User,
+        name: names.get(uid).cloned(),
+        avatar: live.avatar_of(uid),
+    };
+    live.outbox.push(Event::People {
+        people: vec![person],
+    });
 }
 
 /// 一条消息里要显示名字的人：发送人与被提及的人。
@@ -251,7 +338,9 @@ pub(crate) fn mentioned(message: &Message) -> Vec<Uid> {
     let mut uids = vec![message.sender.clone()];
     if let Some(Content::Post { parts, .. }) = &message.content {
         uids.extend(parts.iter().filter_map(|p| match p {
-            friend_im_client::core::message::Part::Mention { uid: Some(uid), .. } => Some(uid.clone()),
+            friend_im_client::core::message::Part::Mention { uid: Some(uid), .. } => {
+                Some(uid.clone())
+            }
             _ => None,
         }));
     }
@@ -269,7 +358,13 @@ async fn recalled(live: &Live, recall: &Message, target: &MsgId) -> Option<Wire>
         return None;
     };
     let names = live.names([sender.clone()]).await;
-    Some(translate::recalled(recall.conv.as_str(), target, &sender, ts_ms, &names))
+    Some(translate::recalled(
+        recall.conv.as_str(),
+        target,
+        &sender,
+        ts_ms,
+        &names,
+    ))
 }
 
 async fn search(live: &Live, recall: &Message, target: &MsgId) -> Option<(Uid, i64)> {
@@ -278,8 +373,12 @@ async fn search(live: &Live, recall: &Message, target: &MsgId) -> Option<(Uid, i
         let page = live.client.history(&recall.conv, before, 100).await.ok()?;
         for item in &page.items {
             match item {
-                HistoryItem::Message(m) if &m.id == target => return Some((m.sender.clone(), m.ts_ms)),
-                HistoryItem::Rejected { id, sender, ts_ms, .. } if id == target => return Some((sender.clone(), *ts_ms)),
+                HistoryItem::Message(m) if &m.id == target => {
+                    return Some((m.sender.clone(), m.ts_ms));
+                }
+                HistoryItem::Rejected {
+                    id, sender, ts_ms, ..
+                } if id == target => return Some((sender.clone(), *ts_ms)),
                 _ => {}
             }
         }
@@ -298,7 +397,9 @@ async fn drop_groups_left_by_reset(live: &Live) {
         Ok(groups) => {
             for conv in groups {
                 live.forget_conversation(&conv);
-                live.outbox.push(Event::ConversationRemoved { conversation_id: conv.to_string() });
+                live.outbox.push(Event::ConversationRemoved {
+                    conversation_id: conv.to_string(),
+                });
             }
         }
         Err(error) => tracing::info!(%error, "重置后退出的群没查成，下次连上再看"),
@@ -352,15 +453,23 @@ async fn backfill_rejoined(live: &Live, conv: &ConvId, joined_log: u64) {
 async fn push_history_item(live: &Live, conv: &ConvId, item: HistoryItem) {
     match item {
         HistoryItem::Message(message) => on_message(live, &live.outbox, message).await,
-        HistoryItem::Rejected { id, ts_ms, sender, .. } => {
+        HistoryItem::Rejected {
+            id, ts_ms, sender, ..
+        } => {
             let names = live.names([sender.clone()]).await;
             let wire = translate::unreadable(conv.as_str(), &id, &sender, ts_ms, &names);
-            live.outbox.push(Event::Messages { conversation_id: conv.to_string(), messages: vec![wire] });
+            live.outbox.push(Event::Messages {
+                conversation_id: conv.to_string(),
+                messages: vec![wire],
+            });
         }
         HistoryItem::Notice(notice) => {
             let names = live.names(translate::notice_people(&notice)).await;
             if let Some(wire) = translate::notice(&notice, &names, &live.me) {
-                live.outbox.push(Event::Messages { conversation_id: conv.to_string(), messages: vec![wire] });
+                live.outbox.push(Event::Messages {
+                    conversation_id: conv.to_string(),
+                    messages: vec![wire],
+                });
             }
         }
     }
@@ -381,7 +490,12 @@ async fn on_notice(live: &Live, outbox: &Outbox, notice: Notice) {
     let i_left = left(&live.me, &notice);
     let changed = matches!(
         notice.change,
-        ConvNotice::Created { .. } | ConvNotice::Added { .. } | ConvNotice::JoinedByInvite | ConvNotice::ProfileChanged | ConvNotice::Left | ConvNotice::Removed { .. }
+        ConvNotice::Created { .. }
+            | ConvNotice::Added { .. }
+            | ConvNotice::JoinedByInvite
+            | ConvNotice::ProfileChanged
+            | ConvNotice::Left
+            | ConvNotice::Removed { .. }
     );
     if changed {
         live.forget_conversation(&conv);
@@ -393,10 +507,15 @@ async fn on_notice(live: &Live, outbox: &Outbox, notice: Notice) {
     }
     let names = live.names(translate::notice_people(&notice)).await;
     if let Some(wire) = translate::notice(&notice, &names, &live.me) {
-        outbox.push(Event::Messages { conversation_id: conv.to_string(), messages: vec![wire] });
+        outbox.push(Event::Messages {
+            conversation_id: conv.to_string(),
+            messages: vec![wire],
+        });
     }
     if i_left {
-        outbox.push(Event::ConversationRemoved { conversation_id: conv.to_string() });
+        outbox.push(Event::ConversationRemoved {
+            conversation_id: conv.to_string(),
+        });
     }
 }
 
@@ -420,17 +539,24 @@ async fn save_credentials(server: &Server, live: &Live) {
 /// 这台电脑不能再用了：告诉宿主要重新登录，下线。
 async fn expire(server: &Server, reason: ReauthReason, message: &str) {
     tracing::warn!(?reason, "授权失效，下线");
-    server.peer.notify("session/expired", SessionExpiredParams { reason, message: message.into() });
+    server.peer.notify(
+        "session/expired",
+        SessionExpiredParams {
+            reason,
+            message: message.into(),
+        },
+    );
     server.close_session().await;
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn event(n: usize) -> Event {
-        Event::ConversationRemoved { conversation_id: format!("c{n}") }
+        Event::ConversationRemoved {
+            conversation_id: format!("c{n}"),
+        }
     }
 
     #[test]
@@ -441,12 +567,20 @@ mod tests {
         }
         outbox.position(40);
         let (first, position) = outbox.take(None).unwrap();
-        assert_eq!((first.len(), position), (BATCH_MAX, None), "队列没推空：不带位置");
+        assert_eq!(
+            (first.len(), position),
+            (BATCH_MAX, None),
+            "队列没推空：不带位置"
+        );
         let (rest, position) = outbox.take(None).unwrap();
         assert_eq!((rest.len(), position), (3, Some(40)));
         assert!(outbox.take(Some(40)).is_none(), "推过的位置不再推");
         outbox.position(41);
-        assert_eq!(outbox.take(Some(40)).map(|(e, p)| (e.len(), p)), Some((0, Some(41))), "只有位置往前走了也推一次");
+        assert_eq!(
+            outbox.take(Some(40)).map(|(e, p)| (e.len(), p)),
+            Some((0, Some(41))),
+            "只有位置往前走了也推一次"
+        );
         outbox.position(39);
         assert!(outbox.take(Some(41)).is_none(), "位置不往回退");
     }
