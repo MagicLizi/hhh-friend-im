@@ -1,19 +1,22 @@
-//! 客户端的内部状态与事件处理：补拉、推送、消息验签解密、签名链变化。
+//! 客户端的内部状态与事件处理：控制面补拉、推送、设备帧、消息验签解密、签名链变化。
 //!
-//! 所有事件按日志序号递增处理，处理过的序号记在 `position`：断线重连后从这里补拉，
-//! 推送里序号不大于它的跳过——不漏、不重（契约 S19）。
+//! 控制面事件按日志序号递增处理，处理过的序号记在 `position`：断线重连后从这里补拉，
+//! 推送里序号不大于它的跳过——不漏、不重（契约 S19）。消息不在这里，走设备对账（[`crate::sync`]）。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use friend_im_core::account::{AccountChange, AccountState};
 use friend_im_core::conv::MemberRef;
-use friend_im_core::ids::{ConvId, RequestId, Uid};
-use friend_im_core::keys::ConvSeed;
+use friend_im_core::ids::{ConvId, DeviceId, RequestId, Uid};
+use friend_im_core::keys::{ConvSeed, DevicePublic};
 use friend_im_core::limits;
+use friend_im_core::message::Envelope;
 use friend_im_core::pake::{ApproverHandshake, NewDeviceHandshake};
+use friend_im_core::peer::SealedFrame;
 use friend_im_core::wire::{
     AccountKeyBundle, DeviceKeyBox, DeviceStatus, Event, JoinCloseReason, JoinRequestInfo, Push,
-    Request, Response, StoredMessage, SyncEvent,
+    Request, Response, SyncEvent,
 };
 use friend_im_core::words::JoinCode;
 use friend_im_core::{crypto, keys};
@@ -23,7 +26,8 @@ use crate::book::Book;
 use crate::conn::Conn;
 use crate::error::{ClientError, Result};
 use crate::keyring::Keyring;
-use crate::lan::DirectInbound;
+use crate::reading::ReadingBook;
+use crate::sync::PeerFrame;
 use crate::types::{AccountNotice, Config, Credentials, Message, Notice, Update};
 
 /// 新电脑这边进行中的批准。
@@ -55,7 +59,6 @@ pub(crate) struct State {
     pub name: String,
     pub epoch: u32,
     pub status: DeviceStatus,
-    pub reading: bool,
     pub friend_requests: bool,
     /// 当前连接登录时服务器的日志序号：新电脑从这里开始同步。
     pub sync_head: u64,
@@ -70,10 +73,16 @@ pub(crate) struct State {
     pub updates: mpsc::UnboundedSender<Update>,
     /// 当前连接认下的服务器的钟。
     pub clock: ServerClock,
-    /// 已经通过直连或服务器处理过的消息编号，防止两条路径重复显示。
-    pub seen_messages: HashSet<friend_im_core::ids::MsgId>,
-    pub seen_order: VecDeque<friend_im_core::ids::MsgId>,
+    /// 各设备的已读记录（只在内存里）。
+    pub readings: ReadingBook,
+    /// 见过的设备 → 账号（在线状态与帧里来的）。
+    pub owners: HashMap<DeviceId, Uid>,
+    /// 为判断对账权限刚补取过签名链的会话：不让一个被拒的伙伴反复触发补取。
+    pub refreshed: HashMap<ConvId, Instant>,
 }
+
+/// 同一个会话的签名链，为判断对账权限至多多久补取一次。
+const REFRESH_GAP: Duration = Duration::from_secs(10);
 
 /// 记一次失败：连接断了是预期内的（重连后补拉），只记普通信息；其余的要关注。
 pub(crate) fn log_failure(error: &ClientError, what: &str) {
@@ -325,32 +334,11 @@ impl State {
         if self.status != DeviceStatus::Active {
             return;
         }
-        if let Event::Message { msg } = &event.event {
-            if self.seen_messages.contains(&msg.env.id) {
-                self.position = Some(self.position.unwrap_or(0).max(event.log));
-                return;
-            }
-            self.remember_message(&msg.env.id);
-        }
         if self.position.is_some_and(|p| event.log <= p) {
             return;
         }
         let log = event.log;
         match event.event {
-            Event::Message { msg } => match self.open_message(conn, &msg).await {
-                Ok(message) => self.emit(Update::Message(message)),
-                Err(error) => {
-                    tracing::warn!(conv = %msg.env.conv, log, %error, "消息解不开或验不过");
-                    self.emit(Update::MessageRejected {
-                        conv: msg.env.conv.clone(),
-                        id: msg.env.id.clone(),
-                        log,
-                        ts_ms: msg.ts_ms,
-                        sender: msg.env.sender.clone(),
-                        reason: error.to_string(),
-                    });
-                }
-            },
             Event::ConvLink { conv, link } => self.on_conv_link(conn, &conv, &link, log).await,
             // 会话钥匙按需取，新封装不用当场处理。
             Event::ConvKeys { .. } => {}
@@ -361,47 +349,84 @@ impl State {
         self.position = Some(log);
     }
 
-    /// 处理已经由局域网提交真实日志号的消息。直连消息可能比服务器当前推送位置更早，
-    /// 因此按消息编号去重而不是用日志位置拦截。
-    pub async fn handle_direct(&mut self, conn: &Conn, direct: DirectInbound) {
-        if self.status != DeviceStatus::Active || self.seen_messages.contains(&direct.env.id) {
+    /// 收到别的设备的一帧（服务器转交或局域网）：核对发送设备属于这个账号、解开，交给上层。
+    pub async fn handle_frame(&mut self, conn: &Conn, frame: SealedFrame) {
+        if self.status != DeviceStatus::Active {
             return;
         }
-        let id = direct.env.id.clone();
-        self.remember_message(&id);
-        let msg = StoredMessage {
-            log: direct.log,
-            ts_ms: direct.ts_ms,
-            env: direct.env,
-            recalled: false,
-        };
-        match self.open_message(conn, &msg).await {
-            Ok(message) => self.emit(Update::Message(message)),
-            Err(error) => {
-                tracing::warn!(conv = %msg.env.conv, log = direct.log, %error, "局域网消息解不开或验不过");
-                self.emit(Update::MessageRejected {
-                    conv: msg.env.conv.clone(),
-                    id: msg.env.id.clone(),
-                    log: direct.log,
-                    ts_ms: direct.ts_ms,
-                    sender: msg.env.sender.clone(),
-                    reason: error.to_string(),
-                });
+        match self.open_frame(conn, &frame).await {
+            Ok(opened) => {
+                self.owners.insert(frame.from.clone(), frame.uid.clone());
+                self.emit(Update::Frame { uid: frame.uid, from: frame.from, frame: opened });
             }
+            Err(ClientError::Disconnected | ClientError::Timeout) => {
+                tracing::info!("这会儿核对不了发来帧的设备，丢掉，下次对账再来");
+            }
+            Err(error) => tracing::warn!(%error, device = %frame.from, "发来的帧验不过，丢掉"),
         }
-        self.position = Some(self.position.unwrap_or(0).max(direct.log));
-        self.emit(Update::Position(self.position.unwrap_or(direct.log)));
     }
 
-    fn remember_message(&mut self, id: &friend_im_core::ids::MsgId) {
-        if self.seen_messages.insert(id.clone()) {
-            self.seen_order.push_back(id.clone());
-            while self.seen_order.len() > 8192 {
-                if let Some(old) = self.seen_order.pop_front() {
-                    self.seen_messages.remove(&old);
-                }
+    async fn open_frame(&mut self, conn: &Conn, frame: &SealedFrame) -> Result<PeerFrame> {
+        let key = self.current_device(conn, &frame.uid, &frame.from).await?;
+        let plain = frame.open(&self.creds.device, &key)?;
+        serde_json::from_slice(&plain).map_err(|_| ClientError::verify("帧读不懂"))
+    }
+
+    /// 这个账号现在的这台设备的公钥；缓存里没有就补取一次。
+    async fn current_device(&mut self, conn: &Conn, uid: &Uid, device: &DeviceId) -> Result<DevicePublic> {
+        let find = |book: &Book| {
+            book.current(uid)
+                .and_then(|state| state.active_devices().find(|(id, _)| *id == device).map(|(_, record)| record.keys))
+        };
+        if let Some(key) = find(&self.book) {
+            return Ok(key);
+        }
+        self.book.load_account(conn, uid, None).await?;
+        find(&self.book).ok_or_else(|| ClientError::verify("这台设备不属于这个账号，或已被移除"))
+    }
+
+    /// 封一帧给一台设备。
+    pub(crate) async fn seal_frame(&mut self, conn: &Conn, to: &DeviceId, frame: &PeerFrame) -> Result<SealedFrame> {
+        let uid = self.owners.get(to).cloned().ok_or_else(|| ClientError::state("不认识这台设备"))?;
+        let key = self.current_device(conn, &uid, to).await?;
+        let plain = serde_json::to_vec(frame).map_err(|_| ClientError::protocol("帧写不出"))?;
+        Ok(SealedFrame::seal(&self.uid, &self.creds.device, &key, &plain)?)
+    }
+
+    /// 这台设备能不能和我交换这个会话：同账号，或双方都是会话的当前成员（以我验过的签名链为准）。
+    pub(crate) async fn may_share(&mut self, conn: &Conn, conv: &ConvId, peer: &DeviceId) -> bool {
+        let Some(uid) = self.owners.get(peer).cloned() else {
+            return false;
+        };
+        if uid == self.uid {
+            return true;
+        }
+        let me = self.uid.clone();
+        let both = |book: &Book| book.convs.get(conv).is_some_and(|record| record.state.members.contains_key(&me) && record.state.members.contains_key(&uid));
+        if both(&self.book) {
+            return true;
+        }
+        // 手里的链可能旧了（对方刚进群）：补取一次再看。
+        if self.refreshed.get(conv).is_some_and(|at| at.elapsed() < REFRESH_GAP) {
+            return false;
+        }
+        self.refreshed.insert(conv.clone(), Instant::now());
+        match self.book.load_conv(conn, conv).await {
+            Ok(_) => both(&self.book),
+            Err(error) => {
+                tracing::debug!(%conv, %error, "补取会话签名链没成，这次不和对方交换");
+                false
             }
         }
+    }
+
+    /// 第 `generation` 代钥匙在用的日志区间；手里的链还没有这一代就补取一次。
+    pub(crate) async fn generation_window(&mut self, conn: &Conn, conv: &ConvId, generation: u32) -> Result<(u64, Option<u64>)> {
+        if let Some(window) = self.book.convs.get(conv).and_then(|record| record.generation_window(generation)) {
+            return Ok(window);
+        }
+        self.book.load_conv(conn, conv).await?;
+        self.book.convs[conv].generation_window(generation).ok_or_else(|| ClientError::verify("会话签名链里没有这一代钥匙"))
     }
 
     async fn on_conv_link(
@@ -620,43 +645,29 @@ impl State {
         }
     }
 
-    /// 解开并核对一条消息：会话签名链覆盖到这一代、发送电脑当时属于发送账号、发送人当时是成员、签名对、密文没被改。
-    pub async fn open_message(&mut self, conn: &Conn, msg: &StoredMessage) -> Result<Message> {
-        let env = &msg.env;
-        let mut message = Message {
+    /// 解开并核对一封信封：这一代钥匙在用的时候发送人是成员、发送电脑属于发送账号且有效、签名对、密文没被改。
+    pub(crate) async fn open_envelope(&mut self, conn: &Conn, env: &Envelope) -> Result<Message> {
+        let (mut start, mut end) = self.generation_window(conn, &env.conv, env.generation).await?;
+        let member = |book: &Book, start, end| book.convs[&env.conv].member_during(&env.sender, &env.sender_eldest, start, end);
+        if !member(&self.book, start, end) {
+            self.book.load_conv(conn, &env.conv).await?;
+            (start, end) = self.generation_window(conn, &env.conv, env.generation).await?;
+            if !member(&self.book, start, end) {
+                return Err(ClientError::verify("发送的人当时不在这个会话里"));
+            }
+        }
+        let device = self.book.ensure_device_during(conn, &env.sender, &env.sender_eldest, &env.device, start, end).await?;
+        let seed = self.conv_seed(conn, &env.conv, env.generation).await?;
+        let body = env.open(&seed, &device)?;
+        Ok(Message {
             conv: env.conv.clone(),
             id: env.id.clone(),
-            log: msg.log,
-            ts_ms: msg.ts_ms,
             sender: env.sender.clone(),
             sender_eldest: env.sender_eldest,
             device: env.device.clone(),
-            ctime_ms: 0,
-            content: None,
-        };
-        if msg.recalled || env.ct.is_empty() {
-            return Ok(message);
-        }
-        let stale = self.book.convs.get(&env.conv).is_none_or(|r| {
-            r.state.key(env.generation).is_none()
-                || !r.member_at(&env.sender, &env.sender_eldest, msg.log)
-        });
-        if stale {
-            self.book.load_conv(conn, &env.conv).await?;
-        }
-        let record = self.book.conv(conn, &env.conv).await?;
-        if !record.member_at(&env.sender, &env.sender_eldest, msg.log) {
-            return Err(ClientError::verify("发送的人当时不在这个会话里"));
-        }
-        let device = self
-            .book
-            .ensure_device(conn, &env.sender, &env.sender_eldest, &env.device, msg.log)
-            .await?;
-        let seed = self.conv_seed(conn, &env.conv, env.generation).await?;
-        let body = env.open(&seed, &device)?;
-        message.ctime_ms = body.ctime_ms;
-        message.content = Some(body.content);
-        Ok(message)
+            ctime_ms: body.ctime_ms,
+            content: body.content,
+        })
     }
 
     // ---------- 推送 ----------
@@ -664,7 +675,13 @@ impl State {
     /// 处理一条服务器推送。
     pub async fn handle_push(&mut self, conn: &Conn, push: Push) -> Flow {
         match push {
-            Push::ReadingChanged { conv } => self.emit(Update::ReadingChanged { conv }),
+            Push::Relayed { frame, .. } => self.handle_frame(conn, frame).await,
+            Push::Presence { uid, device, online } => {
+                if online {
+                    self.owners.insert(device.clone(), uid.clone());
+                }
+                self.emit(Update::Presence { uid, device, online });
+            }
             Push::FriendRequestsChanged => self.emit(Update::FriendRequestsChanged),
             Push::Event { event } => {
                 let log = event.log;

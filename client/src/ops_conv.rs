@@ -1,4 +1,4 @@
-//! 会话：私聊、群、邀请、移出与退群、换代、发消息、翻历史。
+//! 会话：私聊、群、邀请、移出与退群、换代、封消息。
 //!
 //! 换代（[`State::rotate`]）是所有“之后的新内容要用新钥匙”的入口：有人离开、成员换了账号钥匙、对方重置了账号。
 //! 它在同一个请求里先补上需要的环——群里把重置过账号的人移出；私聊里改记对方的新身份（这一代不带旧钥匙链，
@@ -9,21 +9,19 @@ use friend_im_core::conv::{
     create_body, invite_join_proof,
 };
 use friend_im_core::crypto;
-use friend_im_core::ids::{ConvId, DeviceId, InviteId, MsgId, Uid};
+use friend_im_core::ids::{ConvId, InviteId, MsgId, Uid};
 use friend_im_core::keys::{ConvSeed, InviteSecret, conv_seed_info};
 use friend_im_core::limits;
 use friend_im_core::message::{Content, Envelope, MESSAGE_VERSION, MessageBody, Sender};
 use friend_im_core::wire::{
-    ConvActivity, ConvKeyBundle, ConvSummary, ErrorCode, InviteSeed, MemberKeyBox, Request,
-    Response,
+    ConvKeyBundle, ConvSummary, ErrorCode, InviteSeed, MemberKeyBox, Request, Response,
 };
 
 use crate::conn::Conn;
 use crate::error::{ClientError, Result};
-use crate::lan::Lan;
 use crate::links::{InviteLink, http_base};
 use crate::state::State;
-use crate::types::{ConvInfo, HistoryItem, HistoryPage, Notice};
+use crate::types::{ConvInfo, Notice};
 
 /// 自己签、还没提交的环在本地预演时用的日志位置：比任何真实位置都大，签名电脑一定还在。
 const PREVIEW_LOG: u64 = u64::MAX - 1;
@@ -762,22 +760,21 @@ impl State {
         }
     }
 
-    /// 发消息（契约 S14）。`id` 由调用方取：同一次发送重试时用同一个编号，服务器保证不会出现两条。
-    /// 会话要先换代时（有人离开、成员换了钥匙、对方重置）先换代再发。返回（日志序号，服务器时间）。
-    pub async fn send(
-        &mut self,
-        conn: &Conn,
-        conv: &ConvId,
-        id: &MsgId,
-        content: Content,
-        lan: &Lan,
-    ) -> Result<(u64, i64)> {
+    /// 这个会话从头到现在的系统提示（新设备补给宿主：它们来自签名链，所有设备一样）。
+    pub async fn notices(&mut self, conn: &Conn, conv: &ConvId) -> Result<Vec<Notice>> {
+        let record = self.book.conv(conn, conv).await?;
+        Ok(record.links.iter().filter_map(|(link, log)| Notice::from_link(conv, link, *log)).collect())
+    }
+
+    /// 封一条消息（契约 S14）：`at` 是排序时间，由调用方按本会话见过的最大时间算。会话要先换代时先换代。
+    /// 用到的签名链和钥匙优先用手里的：断网时照样能封，等对账送达；手里没有才向服务器取。
+    pub async fn seal(&mut self, conn: &Conn, conv: &ConvId, id: &MsgId, content: Content, at: i64) -> Result<Envelope> {
         self.require_active()?;
         self.ensure_account_keys(conn).await?;
         let me = self.my_ref(conn).await?;
         let body = MessageBody {
             v: MESSAGE_VERSION,
-            ctime_ms: self.now_ms(),
+            ctime_ms: at,
             content,
         };
         let mut last = None;
@@ -804,144 +801,37 @@ impl State {
                 }
                 Err(error) => return Err(error),
             };
+            // 发之前问服务器要不要先换代（有人离开、有人换了账号钥匙）：服务器只答这一句，不经手内容。断网时跳过，按手里的状态发。
+            match conn
+                .request(Request::BeforeSend {
+                    conv: conv.clone(),
+                    generation,
+                })
+                .await
+            {
+                Ok(_) | Err(ClientError::Disconnected | ClientError::Timeout) => {}
+                Err(error) => match error.code() {
+                    Some(ErrorCode::RotationRequired) => {
+                        self.rotate(conn, conv, Vec::new()).await?;
+                        last = Some(error);
+                        continue;
+                    }
+                    Some(ErrorCode::Conflict) => {
+                        // 别人刚换过代：刷新会话签名链后用新一代。
+                        self.book.load_conv(conn, conv).await?;
+                        last = Some(error);
+                        continue;
+                    }
+                    _ => return Err(error),
+                },
+            }
             let sender = Sender {
                 uid: &self.uid,
                 eldest: me.eldest,
                 device: &self.creds.device,
             };
-            let env = Envelope::seal(conv, id.clone(), generation, &seed, &sender, &body)?;
-            let members: Vec<Uid> = self.book.convs[conv]
-                .state
-                .members
-                .keys()
-                .cloned()
-                .collect();
-            let mut allowed_devices = Vec::<DeviceId>::new();
-            for uid in &members {
-                if self.book.current(uid).is_none() {
-                    let _ = self.book.load_account(conn, uid, None).await;
-                }
-                if let Some(account) = self.book.current(uid) {
-                    allowed_devices
-                        .extend(account.active_devices().map(|(device, _)| device.clone()));
-                }
-            }
-            let offered = lan.offer(&env, &members, &allowed_devices).await;
-            let direct = !offered.is_empty();
-            let request = if direct {
-                Request::SendLan { env: env.clone() }
-            } else {
-                Request::Send { env: env.clone() }
-            };
-            match conn.request(request).await {
-                Ok(Response::Sent { log, ts_ms }) if direct => {
-                    let delivered = lan.commit(id, log, ts_ms, &offered).await;
-                    if let Err(error) = conn
-                        .request(Request::ReleaseMessage {
-                            conv: conv.clone(),
-                            id: id.clone(),
-                            direct_devices: delivered.clone(),
-                        })
-                        .await
-                    {
-                        // 消息已经持久化；释放失败时保留服务器同步语义，重连后仍能补拉。
-                        tracing::warn!(%error, conv = %conv, "释放直连消息的服务器推送失败，稍后由同步补齐");
-                    }
-                    return Ok((log, ts_ms));
-                }
-                Ok(Response::Sent { log, ts_ms }) => return Ok((log, ts_ms)),
-                Ok(_) => return Err(ClientError::protocol("回执不对")),
-                Err(error) => {
-                    if direct {
-                        lan.cancel(id, &offered).await;
-                    }
-                    match error.code() {
-                        Some(ErrorCode::RotationRequired) => {
-                            self.rotate(conn, conv, Vec::new()).await?;
-                            last = Some(error);
-                        }
-                        Some(ErrorCode::Conflict) => {
-                            // 别人刚换过代：刷新会话签名链后用新一代重发；代数没变就是消息编号被占用。
-                            self.book.load_conv(conn, conv).await?;
-                            if self.book.convs[conv].state.current_key().generation == generation {
-                                return Err(error);
-                            }
-                            last = Some(error);
-                        }
-                        _ => return Err(error),
-                    }
-                }
-            }
+            return Ok(Envelope::seal(conv, id.clone(), generation, &seed, &sender, &body)?);
         }
         Err(last.unwrap_or(ClientError::Timeout))
-    }
-
-    /// 往前翻一页历史：消息解开核对，会话签名链里同一段的系统提示合进来，按日志序号从新到旧。
-    /// `window` 是服务器时间的范围（毫秒，两端都含、可以只给一端）：消息按服务器时间筛，系统提示按签它的人写的时间筛。
-    pub async fn history(
-        &mut self,
-        conn: &Conn,
-        conv: &ConvId,
-        before: Option<u64>,
-        limit: u32,
-        window: (Option<i64>, Option<i64>),
-    ) -> Result<HistoryPage> {
-        self.require_active()?;
-        let (since_ms, until_ms) = window;
-        let Response::Messages { items, more } = conn
-            .request(Request::History {
-                conv: conv.clone(),
-                before,
-                limit: limit.clamp(1, limits::HISTORY_PAGE_MAX),
-                since_ms,
-                until_ms,
-            })
-            .await?
-        else {
-            return Err(ClientError::protocol("回执不对"));
-        };
-        self.book.load_conv(conn, conv).await?;
-        let upper = before.unwrap_or(u64::MAX);
-        let lower = if more {
-            items.last().map_or(0, |m| m.log)
-        } else {
-            0
-        };
-        let mut page = Vec::with_capacity(items.len());
-        for msg in &items {
-            match self.open_message(conn, msg).await {
-                Ok(message) => page.push(HistoryItem::Message(message)),
-                Err(error) => page.push(HistoryItem::Rejected {
-                    id: msg.env.id.clone(),
-                    log: msg.log,
-                    ts_ms: msg.ts_ms,
-                    sender: msg.env.sender.clone(),
-                    reason: error.to_string(),
-                }),
-            }
-        }
-        let record = &self.book.convs[conv];
-        let in_window =
-            |ms: i64| since_ms.is_none_or(|s| ms >= s) && until_ms.is_none_or(|u| ms <= u);
-        for (link, log) in &record.links {
-            if *log > lower
-                && *log < upper
-                && let Some(notice) = Notice::from_link(conv, link, *log)
-                && in_window(notice.ctime_ms)
-            {
-                page.push(HistoryItem::Notice(notice));
-            }
-        }
-        page.sort_by_key(|item| std::cmp::Reverse(item.log()));
-        Ok(HistoryPage { items: page, more })
-    }
-
-    /// 会话活动：自己所在的会话里 `since_ms` 起有消息的，每个会话最早、最新一条的服务器时间（不解任何内容）。
-    pub async fn activity(&mut self, conn: &Conn, since_ms: i64) -> Result<Vec<ConvActivity>> {
-        self.require_active()?;
-        match conn.request(Request::Activity { since_ms }).await? {
-            Response::Activity { items } => Ok(items),
-            _ => Err(ClientError::protocol("回执不对")),
-        }
     }
 }

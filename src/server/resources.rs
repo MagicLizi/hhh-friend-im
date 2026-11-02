@@ -1,10 +1,9 @@
 //! 资源与上传（protocol-v1 §9）。
 //!
-//! - 读：资源键里有文件编号与文件钥匙（`translate::resource_key`），按宿主要的那一段向服务器取盖住它的加密块、
-//!   在本机逐块核对后解开。一段至多 1 MiB，断了宿主从断处接着读。
-//! - 上传：Cindy IM 的文件要用会话的人才看得见的钥匙加密，上传时就得知道发到哪个会话，所以 `uploads/*` 只把字节
-//!   暂存进宿主给的临时目录、核对长度与摘要，`messages/send` 带着这个键来时才加密上传（§9.2 允许的做法）。
-//!   暂存至多 32 份、一小时，发出去就删。
+//! - 读：按宿主要的那一段向在线、有权的设备要（[`super::devices`]）；内容摘要随消息签名，随第一段交给宿主，收完由宿主核对。
+//!   一段至多 1 MiB，断了宿主从断处接着读。没有在线设备有这个文件时报暂时读不到，之后可以重试。
+//! - 上传：`uploads/*` 只把字节暂存进宿主给的临时目录、核对长度与摘要，算出内容摘要写进文件引用（§9.2 允许的做法）。
+//!   文件不离开这台设备：发送成功后宿主存进文件库，别的设备要时从这里取。暂存至多 32 份、一小时，发出去就删。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +13,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use friend_im_client::core::file::FILE_NAME_MAX_CHARS;
-use friend_im_client::core::ids::MsgId;
+use friend_im_client::core::ids::{ConvId, MsgId};
 use friend_im_client::core::limits;
 use hhh_im_protocol::method::{
     ResourceChunk, ResourcesReadParams, UploadsAbortParams, UploadsBeginParams, UploadsBeginResult,
@@ -121,6 +120,7 @@ pub(crate) struct Attachment {
     pub(crate) name: String,
     pub(crate) bytes: u64,
     pub(crate) image: bool,
+    pub(crate) sha256: [u8; 32],
 }
 
 /// 上传的暂存区。
@@ -153,6 +153,7 @@ impl Uploads {
             name: found.name.clone(),
             bytes: found.bytes,
             image: found.kind == ResourceKind::Image,
+            sha256: found.hasher.clone().finalize().into(),
         })
     }
 
@@ -180,7 +181,7 @@ fn to_value(value: impl serde::Serialize) -> Value {
 }
 
 impl Server {
-    /// Cindy IM 只存一份加密附件，解密后的同一份字节用于显示和保存。
+    /// Cindy IM 每个附件只有一份字节，用于显示和保存。
     pub(crate) async fn describe_resource(
         &self,
         params: hhh_im_protocol::method::ResourcesDescribeParams,
@@ -219,20 +220,29 @@ impl Server {
                 "读的位置超出了文件大小。",
             ));
         }
+        let conv = ConvId::parse(&params.conversation_id)
+            .map_err(|_| errors::of(ErrorKind::NotFound, "没有这个会话。"))?;
         let length = params.length.min(SEGMENT_MAX);
         let data = live
-            .client
-            .read_range(&file, params.offset, length)
+            .devices
+            .fetch(&live, &conv, &params.key, params.offset, length)
             .await
             .map_err(|error| {
                 tracing::info!(file = %file.id, offset = params.offset, %error, "读附件没成");
                 errors::client(&error)
             })?;
         let eof = params.offset + data.len() as u64 >= file.size;
+        let sha256 = file.sha256.map(|digest| {
+            digest
+                .0
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
         Ok(to_value(ResourceChunk {
             data: BASE64.encode(&data),
             total: Some(file.size),
-            sha256: None,
+            sha256,
             eof,
         }))
     }

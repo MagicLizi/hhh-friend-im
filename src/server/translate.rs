@@ -3,9 +3,8 @@
 //! 编号的写法：
 //! - 会话、账号（人）、消息：客户端库的编号原样（22 个字符的 base64url）。
 //! - 系统提示：`n-<日志序号>`（来自会话签名链，一条变化一条提示）；签名链核对不通过的提醒：`r-<日志序号>`。
-//! - 资源键：`f1.<文件编号>.<文件钥匙>.<字节数>`（约 80 字节，只在这条消息里有意义）。HHH 读资源时插件凭它向服务器
-//!   取密文、在本机解开。文件钥匙在 HHH 本机的库里，和已经解开的消息同一处，服务器上没有。
-//! - 翻页游标：`b<日志序号>`，下一页取比它早的。
+//! - 资源键：`f2.<文件编号>.<随机值>.<字节数>.<内容摘要>`（只在这条消息里有意义）。HHH 读资源时插件凭它向别的设备要，
+//!   别的设备凭同一个键在它的宿主里找。旧消息的 `f1` 键没有摘要。
 
 use std::collections::HashMap;
 
@@ -14,7 +13,7 @@ use friend_im_client::core::conv::{ConvKind, RemoveReason, Via};
 use friend_im_client::core::file::FileRef;
 use friend_im_client::core::ids::{FileId, MsgId, Uid};
 use friend_im_client::core::message::{Content, Part};
-use friend_im_client::{ConvNotice, HistoryItem, Message, Notice};
+use friend_im_client::{ConvNotice, Message, Notice};
 use hhh_im_protocol::types::{
     Block, Message as Wire, Outgoing, OutgoingVideo, PersonKind, Resource, ResourceCover,
     ResourceKind, Sender, SenderKind,
@@ -23,32 +22,33 @@ use hhh_im_protocol::types::{
 /// 账号编号 → 名字（只用来显示；没有的写“有人”）。
 pub(crate) type Names = HashMap<Uid, String>;
 
-/// 资源键的前缀（格式第 1 版）。
-const KEY_PREFIX: &str = "f1";
+/// 资源键的前缀（格式第 2 版，带内容摘要）。
+const KEY_PREFIX: &str = "f2";
+/// 旧消息的资源键前缀（没有摘要）。
+const OLD_KEY_PREFIX: &str = "f1";
 
 /// 文件引用 → 资源键。
 pub(crate) fn resource_key(file: &FileRef) -> String {
-    format!(
-        "{KEY_PREFIX}.{}.{}.{}",
-        file.id,
-        bytes::encode(&file.key.0),
-        file.size
-    )
+    let key = format!("{}.{}.{}", file.id, bytes::encode(&file.key.0), file.size);
+    match &file.sha256 {
+        Some(digest) => format!("{KEY_PREFIX}.{key}.{}", bytes::encode(&digest.0)),
+        None => format!("{OLD_KEY_PREFIX}.{key}"),
+    }
 }
 
 /// 资源键 → 读文件用的引用（文件名与类型读的时候用不到，留空）。格式不对为 `None`。
 pub(crate) fn file_of_key(key: &str) -> Option<FileRef> {
-    let mut parts = key.split('.');
-    let (Some(KEY_PREFIX), Some(id), Some(secret), Some(size), None) = (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-    ) else {
-        return None;
+    let parts: Vec<&str> = key.split('.').collect();
+    let (id, secret, size, digest) = match parts.as_slice() {
+        [KEY_PREFIX, id, secret, size, digest] => (*id, *secret, *size, Some(*digest)),
+        [OLD_KEY_PREFIX, id, secret, size] => (*id, *secret, *size, None),
+        _ => return None,
     };
     let secret: [u8; 32] = bytes::decode(secret)?.try_into().ok()?;
+    let sha256 = match digest {
+        Some(digest) => Some(Fixed::<32>(bytes::decode(digest)?.try_into().ok()?)),
+        None => None,
+    };
     Some(FileRef {
         id: FileId::parse(id).ok()?,
         key: Fixed(secret),
@@ -58,17 +58,8 @@ pub(crate) fn file_of_key(key: &str) -> Option<FileRef> {
             .filter(|s| *s <= friend_im_client::core::limits::FILE_PLAIN_MAX)?,
         name: String::new(),
         mime: String::new(),
+        sha256,
     })
-}
-
-/// 翻页游标：下一页取日志序号比它小的。
-pub(crate) fn cursor(log: u64) -> String {
-    format!("b{log}")
-}
-
-/// 读回翻页游标；格式不对为 `None`。
-pub(crate) fn parse_cursor(text: &str) -> Option<u64> {
-    text.strip_prefix('b')?.parse().ok()
 }
 
 fn name_of(names: &Names, uid: &Uid) -> String {
@@ -179,23 +170,20 @@ fn system() -> Sender {
 }
 
 /// 一条解开的消息 → 协议的消息。撤回动作本身（`Content::Recall`）与个人资料（`Content::Profile`）不是给人看的消息，
-/// 为 `None`：被撤回的那条由 [`recalled`] 另外报，个人资料只记下头像。时间用服务器收到的时间（和按时间读历史同一把尺子）。
+/// 为 `None`。时间是发送方签名的排序时间，所有设备一样。
 pub(crate) fn message(m: &Message, names: &Names) -> Option<Wire> {
-    let mut wire = match &m.content {
-        None => Some(recalled(m.conv.as_str(), &m.id, &m.sender, m.ts_ms, names)),
-        Some(Content::Recall { .. } | Content::Profile { .. }) => None,
-        Some(Content::Post { parts, reply_to }) => Some(posted(
+    match &m.content {
+        Content::Recall { .. } | Content::Profile { .. } => None,
+        Content::Post { parts, reply_to } => Some(posted(
             m.conv.as_str(),
             &m.id,
             &m.sender,
-            m.ts_ms,
+            m.ctime_ms,
             parts,
             reply_to.as_ref(),
             names,
         )),
-    }?;
-    wire.read_position = Some(m.log.to_string());
-    Some(wire)
+    }
 }
 
 /// 一条普通消息（收到的，或刚发出去的）。
@@ -229,25 +217,6 @@ pub(crate) fn recalled(conv: &str, id: &MsgId, sender: &Uid, ts_ms: i64, names: 
         Vec::new(),
     );
     out.deleted = true;
-    out
-}
-
-/// 解不开或验不过的一条：放在原来的位置，写明为什么看不到，整条标“不完整”。
-pub(crate) fn unreadable(conv: &str, id: &MsgId, sender: &Uid, ts_ms: i64, names: &Names) -> Wire {
-    let content = vec![Block::Unsupported {
-        kind: "friend-im-unreadable".into(),
-        label: Some(
-            "这条消息解不开：可能是对方重置账号之前发的，或服务器给的内容没通过核对。".into(),
-        ),
-    }];
-    let mut out = wire(
-        id.to_string(),
-        conv.to_owned(),
-        user(sender, names),
-        ts_ms,
-        content,
-    );
-    out.incomplete = true;
     out
 }
 
@@ -316,21 +285,6 @@ pub(crate) fn notice_text(notice: &Notice, names: &Names, me: &Uid) -> Option<St
         | ConvNotice::InviteCreated { .. }
         | ConvNotice::InviteRevoked { .. } => return None,
     })
-}
-
-/// 翻到的一项算不算“有人发了消息”（会话发现用，协议 `conversations/recentActivity`）：算的话给它的时间与发的人。
-/// 只算翻历史时给人看的新内容——普通消息、解不开的那条、给人看的系统提示；个人资料、撤回、换钥匙这些不给人看的不算，
-/// 已经撤回、只剩“已撤回”的那条也不算新消息。
-pub(crate) fn activity_of<'a>(item: &'a HistoryItem, me: &Uid) -> Option<(i64, &'a Uid)> {
-    match item {
-        HistoryItem::Message(m) => {
-            matches!(m.content, Some(Content::Post { .. })).then_some((m.ts_ms, &m.sender))
-        }
-        HistoryItem::Rejected { ts_ms, sender, .. } => Some((*ts_ms, sender)),
-        HistoryItem::Notice(n) => {
-            notice_text(n, &Names::new(), me).map(|_| (n.ctime_ms, &n.author))
-        }
-    }
 }
 
 /// 系统提示要用到的账号（作者、成员）。
@@ -436,15 +390,14 @@ mod tests {
             size: 70_000,
             name: "照片.png".into(),
             mime: "image/png".into(),
+            sha256: Some(Fixed([8; 32])),
         }
     }
 
-    fn msg(content: Option<Content>) -> Message {
+    fn msg(content: Content) -> Message {
         Message {
             conv: ConvId::from_raw([1; 16]),
             id: MsgId::from_raw([2; 16]),
-            log: 9,
-            ts_ms: 1_791_000_000_000,
             sender: uid(5),
             sender_eldest: Fixed([0; 32]),
             device: DeviceId::from_raw([6; 16]),
@@ -456,24 +409,25 @@ mod tests {
     #[test]
     fn resource_keys_round_trip_and_reject_garbage() {
         let key = resource_key(&file());
-        assert!(key.len() < 100, "{key}");
+        assert!(key.len() < 150, "{key}");
         let back = file_of_key(&key).unwrap();
         assert_eq!(
-            (back.id, back.key, back.size),
-            (file().id, file().key, file().size)
+            (back.id, back.key, back.size, back.sha256),
+            (file().id, file().key, file().size, file().sha256)
         );
         for bad in [
             "",
-            "f1",
-            "f2.a.b.1",
-            &format!("{key}.x"),
-            &key.replace("f1.", "f1.x"),
+            &key.replace("f2.", "f2.x"),
             &key.replace(".70000", ".abc"),
+            &key.replace("f2.", "f1."),
         ] {
             assert!(file_of_key(bad).is_none(), "{bad}");
         }
-        assert_eq!(parse_cursor(&cursor(42)), Some(42));
-        assert_eq!(parse_cursor("42"), None);
+        // 旧消息的键没有摘要，照样读得回来。
+        let old = FileRef { sha256: None, ..file() };
+        let old_key = resource_key(&old);
+        assert!(old_key.starts_with("f1."));
+        assert_eq!(file_of_key(&old_key).unwrap().sha256, None);
     }
 
     #[test]
@@ -504,15 +458,15 @@ mod tests {
             },
         ];
         let out = message(
-            &msg(Some(Content::Post {
+            &msg(Content::Post {
                 parts,
                 reply_to: Some(MsgId::from_raw([8; 16])),
-            })),
+            }),
             &names,
         )
         .unwrap();
         assert_eq!(out.sender.name.as_deref(), Some("小满"));
-        assert_eq!(out.created_at_ms, 1_791_000_000_000, "用服务器时间");
+        assert_eq!(out.created_at_ms, 1_791_000_000_001, "用发送方签名的时间");
         assert_eq!(out.reply_to, Some(MsgId::from_raw([8; 16]).to_string()));
         let json = serde_json::to_value(&out.content).unwrap();
         assert_eq!(
@@ -561,10 +515,10 @@ mod tests {
             }),
         }];
         let out = message(
-            &msg(Some(Content::Post {
+            &msg(Content::Post {
                 parts,
                 reply_to: None,
-            })),
+            }),
             &Names::new(),
         )
         .unwrap();
@@ -586,15 +540,14 @@ mod tests {
     }
 
     #[test]
-    fn recalls_and_unreadable_messages() {
+    fn recalls_are_not_shown_as_messages() {
         let names = Names::new();
-        let gone = message(&msg(None), &names).unwrap();
-        assert!(gone.deleted && gone.content.is_empty());
         assert!(
             message(
-                &msg(Some(Content::Recall {
-                    target: MsgId::from_raw([2; 16])
-                })),
+                &msg(Content::Recall {
+                    target: MsgId::from_raw([2; 16]),
+                    target_at: 5
+                }),
                 &names
             )
             .is_none(),
@@ -602,18 +555,17 @@ mod tests {
         );
         assert!(
             message(
-                &msg(Some(Content::Profile {
+                &msg(Content::Profile {
                     avatar: Some("https://a.example.com/1.png".into()),
                     photo: None
-                })),
+                }),
                 &names
             )
             .is_none(),
             "个人资料不显示"
         );
-        let bad = unreadable("c", &MsgId::from_raw([2; 16]), &uid(5), 5, &names);
-        assert!(bad.incomplete);
-        assert!(matches!(&bad.content[0], Block::Unsupported { .. }));
+        let gone = recalled("c", &MsgId::from_raw([2; 16]), &uid(5), 5, &names);
+        assert!(gone.deleted && gone.content.is_empty());
     }
 
     #[test]

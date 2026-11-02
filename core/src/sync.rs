@@ -45,6 +45,18 @@ pub fn raw_digest(data: &str) -> Fixed<16> {
     Fixed(out)
 }
 
+/// 排序键写成宿主要的阅读位置：只有数字、按长度再按字典序比，比出来的先后和排序键一样。
+/// 时间照写；编号的每个字符换成它在 base64url 字符按字节排序里的名次（两位数字）。
+pub fn read_position(key: &Key) -> String {
+    const SORTED: &[u8] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+    let mut out = key.at.max(0).to_string();
+    for byte in key.id.as_str().bytes() {
+        let rank = SORTED.iter().position(|c| *c == byte).unwrap_or(0);
+        out.push_str(&format!("{rank:02}"));
+    }
+    out
+}
+
 /// 排序键：先比时间，再比编号（编号是固定长度的 base64url，按字节比与宿主 SQLite 的默认比较一致）。
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Key {
@@ -507,6 +519,20 @@ mod tests {
         b_gives.sort();
         b_gives.dedup();
         (a_gives, b_gives, rounds, bytes)
+    }
+
+    #[test]
+    fn read_positions_sort_like_keys_and_fit_the_protocol() {
+        let key = |at, raw| Key { at, id: MsgId::from_raw([raw; 16]) };
+        let mut keys = vec![key(1_700_000_000_000, 0), key(1_700_000_000_000, 255), key(1_700_000_000_000, 7), key(999, 3), key(1_700_000_000_001, 1)];
+        keys.sort();
+        let positions: Vec<String> = keys.iter().map(read_position).collect();
+        for pair in positions.windows(2) {
+            assert!(pair[0].len() < pair[1].len() || (pair[0].len() == pair[1].len() && pair[0] < pair[1]), "{pair:?}");
+        }
+        for position in &positions {
+            assert!(position.len() <= 64 && position.bytes().all(|c| c.is_ascii_digit()) && !position.starts_with('0'));
+        }
     }
 
     #[test]

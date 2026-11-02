@@ -9,7 +9,7 @@
   "eldest_hash": "_EDGDa15L8tG1YwVwTO7e_0T5passPVaZq4lNm_LFlU",
   "recovery_words": "fog spot notable regret pizza coffee harvest ensure fog spot notable reflect",
   "recovery_groups": "B9D5-MPJT-B9D5-MPJT-B9D5-MPJT-B8AQ",
-  "hello_frame": "{\"id\":1,\"req\":{\"op\":\"hello\",\"protocol\":1,\"auth\":{\"type\":\"session\",\"token\":\"iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg\"},\"device\":{\"sign\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"enc\":\"D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyA\"},\"name\":\"夹具电脑\",\"sig\":\"6k8KPL9Qd_27uG7VOrqzs6Zau1s5l3rRNkRe_DtNbBeWgowtKGVsQfqUjjNHM3zhgyJ7sVxIQ1_cTMkL56N9AQ\"}}",
+  "hello_frame": "{\"id\":1,\"req\":{\"op\":\"hello\",\"protocol\":2,\"auth\":{\"type\":\"session\",\"token\":\"iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg\"},\"device\":{\"sign\":\"0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc\",\"enc\":\"D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyA\"},\"name\":\"夹具电脑\",\"sig\":\"6k8KPL9Qd_27uG7VOrqzs6Zau1s5l3rRNkRe_DtNbBeWgowtKGVsQfqUjjNHM3zhgyJ7sVxIQ1_cTMkL56N9AQ\"}}",
   "envelope": {
     "conv": "VVVVVVVVVVVVVVVVVVVVVQ",
     "id": "qqqqqqqqqqqqqqqqqqqqqg",
@@ -17,7 +17,7 @@
     "sender": "4MgTT9j2v4ESiAY17iEDmg",
     "sender_eldest": "_EDGDa15L8tG1YwVwTO7e_0T5passPVaZq4lNm_LFlU",
     "device": "QeXFwBA29Vbm-Mv7kvGYAg",
-    "ct": "vdDnV89-pwVNDH-n2sLSzokHQS8fCbBHOm_oSBzTSvruoKiGehss_ndZEBKO6YXrSbWnEZsnsbV4CHJSqPA2A2oId-qgNsGKUg8854YsfXPluHsyUSVG6ccZt3V7NgBf2hsuy-jkFNRetC5n4keOIo48p5PpJjIciFN05vOblipqY_w_26yR3T-1lPVEU0qR8Z8Af60TLIXctmPxA6oQ4CThdIr17xtOxLghdKR6bJcgHXCj9Yc6npFms4rLzx5v3azd3JRmUMGjNun7GNcfSeAvQeWNJxlSBILaBFWMKJZe3ueXHyh1AASqpAeUEWyUX6pHeuTnQNuVu8BwIuuQHoV1J8dI795Azn_sXbm0wiiGT03gipiUWRWLeQ8"
+    "ct": "-N7IIiousfUlgS9yGMlXQiUQTjtvxG2R660OnVwSV3sgBM3VJ-yA4lqtxseoGIWBnaz2TtdcgQATFIWjNVtcQzgAB1_mXIbKnOgDSXFWMwk_Dal4D92bujxdh866hAAsoEeeZw029H5qoZOiltGyL8svS20jaM2rqgEEkyhJwsEd5wnWqaqMRLI2o2CVTC_lL3L_xzDevRz4PVmRfUrSnxhe0v3X89gzRlgrgh9tfE-qZHBw8iiveJhc6ZSxhx9_inVM36DrtkcuoAvvc1guM6TP_ntxK57UOHYg_DiXfwH1aviv_X_T5Hass2FtbVjfdoNG8vq_UDG83OPleZHr-LE8fQ5TqWFn2Df3BUfraVuz0zlDlLElhC5EyH4"
   },
   "message": {
     "v": 1,
@@ -38,8 +38,7 @@
     }
   },
   "account_seed_box": {
-    "enc": "bDnK-4Pt1raIK_aWbT7pxZKviyTNExhYbMyRuBK160g",
-    "ct": "K5DJeTvZ35v5JddKOfehS3E210xo1cJ5d0evQ6Ll3s3HPuXCXziTCoCT2fif8-3u"
-  },
-  "file_sealed": "m4KGaDKt74BLf2o1OaEH4ATVjgAKncY6i8_e-puz7vZPJCYJm2Jnf1E-PfgeFn38rt3VFt4LbQ"
+    "enc": "dHwgR5u8F3e4Ezyq2s8e2uZ6195igLG0xKs_J9GdUVo",
+    "ct": "PYGPG6pElfHx9ThDeRsWKWYcjBiAan22rAsTxKDXES_lPYQJDbELVhDUz0E14BCn"
+  }
 }

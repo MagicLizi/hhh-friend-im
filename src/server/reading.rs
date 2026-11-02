@@ -1,8 +1,10 @@
 //! 平台阅读事实翻成宿主协议；会话读取、同步通知都不产生写回。
 use super::{Server, errors, methods::params};
 use friend_im_client::{
-    ReadingMark,
+    Message,
     core::ids::{ConvId, MsgId},
+    core::sync::read_position,
+    peers::Opened,
 };
 use hhh_im_protocol::{
     reading::*,
@@ -11,6 +13,8 @@ use hhh_im_protocol::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use super::session::Live;
 
 fn scope(scope: &ReadScope) -> Result<ConvId, RpcError> {
     if !valid_read_scope(scope) || scope.thread_root.is_some() {
@@ -31,14 +35,61 @@ fn value<T: serde::Serialize>(value: T) -> Result<Value, RpcError> {
 }
 
 impl Server {
-    pub(crate) async fn reading_receipts(&self, input: Value) -> Result<Value, RpcError> {
+    /// 按编号从宿主读回消息并解开：已读回执与已读位置都要知道消息的发送人与排序时间。
+    async fn stored_messages(
+        self: &std::sync::Arc<Self>,
+        live: &std::sync::Arc<Live>,
+        conv: &ConvId,
+        ids: &[MsgId],
+    ) -> Result<Vec<Message>, RpcError> {
+        let store = super::devices::HostStore::new(self.clone(), live.clone());
+        let stored = store
+            .messages(conv, ids)
+            .await
+            .map_err(|reason| errors::of(ErrorKind::Disconnected, reason))?;
+        let mut messages = Vec::with_capacity(stored.len());
+        for wire in stored {
+            let Some(raw) = wire.raw else { continue };
+            if let Ok(Opened::Message(message)) = live.client.open_record(conv, &raw.data).await {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
+    }
+
+    /// 告诉宿主这个会话的已读位置变了。
+    pub(crate) async fn reading_changed(&self, live: &Live, conv: &ConvId) {
+        if !self
+            .reading_events
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        match live.client.reading_through(conv).await {
+            Ok(through) => self.peer.notify(
+                "reading/changed",
+                ReadState {
+                    scope: ReadScope {
+                        conversation_id: conv.to_string(),
+                        thread_root: None,
+                    },
+                    through: through.as_ref().map(read_position),
+                    read_message_ids: Vec::new(),
+                },
+            ),
+            Err(error) => tracing::warn!(%error, "阅读变更未核实，保留原未读"),
+        }
+    }
+
+    pub(crate) async fn reading_receipts(self: &std::sync::Arc<Self>, input: Value) -> Result<Value, RpcError> {
         let p: ReceiptsParams = params(input)?;
         let conv = scope(&p.scope)?;
         let messages = ids(&p.message_ids)?;
         let live = self.live().await?;
+        let stored = self.stored_messages(&live, &conv, &messages).await?;
         let found = live
             .client
-            .reading_receipts(&conv, &messages)
+            .reading_receipts(&conv, &stored)
             .await
             .map_err(|e| errors::client(&e))?;
         value(ReceiptsResult {
@@ -57,7 +108,7 @@ impl Server {
         })
     }
 
-    pub(crate) async fn reading_people(&self, input: Value) -> Result<Value, RpcError> {
+    pub(crate) async fn reading_people(self: &std::sync::Arc<Self>, input: Value) -> Result<Value, RpcError> {
         let p: ReceiptPeopleParams = params(input)?;
         let conv = scope(&p.scope)?;
         let messages = ids(std::slice::from_ref(&p.message_id))?;
@@ -68,9 +119,10 @@ impl Server {
             ));
         }
         let live = self.live().await?;
+        let stored = self.stored_messages(&live, &conv, &messages).await?;
         let receipt = live
             .client
-            .reading_receipts(&conv, &messages)
+            .reading_receipts(&conv, &stored)
             .await
             .map_err(|e| errors::client(&e))?
             .into_iter()
@@ -138,7 +190,7 @@ impl Server {
             .reading_through(&conv)
             .await
             .map_err(|e| errors::client(&e))?
-            .map(|p| p.to_string());
+            .map(|key| read_position(&key));
         value(ReadState {
             scope: p.scope,
             through,
@@ -146,29 +198,26 @@ impl Server {
         })
     }
 
-    pub(crate) async fn reading_mark(&self, input: Value) -> Result<Value, RpcError> {
+    pub(crate) async fn reading_mark(self: &std::sync::Arc<Self>, input: Value) -> Result<Value, RpcError> {
         let p: MarkReadParams = params(input)?;
         let conv = scope(&p.scope)?;
-        let mut messages = ids(std::slice::from_ref(&p.message_id))?;
-        let position = p
-            .position
-            .as_deref()
-            .map(|position| {
-                if !valid_read_position(position) {
-                    return Err(errors::of(ErrorKind::InvalidRequest, "阅读位置无效"));
-                }
-                position.parse::<u64>().map_err(errors::invalid_params)
-            })
-            .transpose()?;
+        let messages = ids(std::slice::from_ref(&p.message_id))?;
+        if p.position.as_deref().is_some_and(|position| !valid_read_position(position)) {
+            return Err(errors::of(ErrorKind::InvalidRequest, "阅读位置无效"));
+        }
         let live = self.live().await?;
-        let result = live
+        let stored = self.stored_messages(&live, &conv, &messages).await?;
+        let Some(message) = stored.into_iter().next() else {
+            return Err(errors::of(ErrorKind::NotFound, "这条消息不在本机"));
+        };
+        let envelope = live
             .client
-            .mark_read(&conv, &messages.remove(0), position)
+            .mark_read(&conv, &message)
             .await
             .map_err(|e| errors::client(&e))?;
-        value(match result {
-            ReadingMark::Applied => MarkReadResult::Applied,
-            ReadingMark::Unknown => MarkReadResult::Unknown,
-        })
+        if let Some(envelope) = envelope {
+            live.devices.reading(conv, envelope);
+        }
+        value(MarkReadResult::Applied)
     }
 }

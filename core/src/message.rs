@@ -3,10 +3,9 @@
 //! - 发送的电脑用自己的签名钥匙签“消息头 + 正文”，签名放进密文里：群里别的成员拿着会话钥匙也仿冒不了别人的消息。
 //! - 用当前一代会话钥匙的消息钥匙加密（XChaCha20-Poly1305），附加数据就是消息头
 //!   （会话、消息编号、代数、发送账号与电脑、撤回目标），改动任何一项都解不开。
-//! - 消息编号由发送的电脑随机生成并签进密文：服务器重放旧密文只会被当成同一条。
+//! - 消息编号由发送的电脑生成并签进密文：重放旧密文只会被当成同一条。
 //!
-//! 撤回本身也是一条消息（[`Content::Recall`]），撤回目标同时写在明文的消息头里：
-//! 服务器据此把同一个人发的原消息密文删掉，接收方解开后核对两处一致、且撤回的人就是原消息的发送者。
+//! 撤回本身也是一条消息（[`Content::Recall`]），撤回目标同时写在消息头里：接收方解开后核对两处一致、且撤回的人就是原消息的发送者。
 
 use serde::{Deserialize, Serialize};
 
@@ -72,7 +71,7 @@ pub enum Part {
 /// 视频封面文件的上限（与宿主交来的视频封面同一上限，契约 hhh-im client v46）。
 pub const COVER_MAX: u64 = 256 * 1024;
 
-/// 视频文件附带的视频信息：封面是同一会话里另一个加密文件（服务器只看到多了一个文件），时长与宽高明文写在加了密的正文里。
+/// 视频文件附带的视频信息：封面是同一会话里另一个文件，时长与宽高写在加了密的正文里。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoInfo {
     /// 封面图（JPEG、PNG 或 WebP，至多 [`COVER_MAX`] 字节）。
@@ -117,6 +116,8 @@ pub enum Content {
     Recall {
         /// 被撤回的消息。
         target: MsgId,
+        /// 被撤回的消息的发送时间：撤回比原消息先到时，靠它定下那条的排序位置。
+        target_at: i64,
     },
     /// 发送人的个人资料：和普通消息一样只有会话里的人解得开，服务器看不出它是个人资料。不给人看，收到的一方按发送人
     /// 记最新的一份。头像两种写法：`photo` 是这个会话里的加密头像文件（契约 friend-im v6，头像用 HHH 自己的）；
@@ -180,7 +181,7 @@ pub struct MessageBody {
     pub content: Content,
 }
 
-/// 消息信封：服务器存、转发的就是它。除 `ct` 以外都是明文的消息头。
+/// 消息信封：设备之间传的、宿主替插件存的就是它。除 `ct` 以外都是明文的消息头。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     /// 会话。
@@ -230,7 +231,7 @@ impl Envelope {
     pub fn seal(conv: &ConvId, id: MsgId, generation: u32, seed: &ConvSeed, sender: &Sender<'_>, body: &MessageBody) -> Result<Self> {
         body.content.check()?;
         let recall = match &body.content {
-            Content::Recall { target } => Some(target.clone()),
+            Content::Recall { target, .. } => Some(target.clone()),
             Content::Post { .. } | Content::Profile { .. } => None,
         };
         let device = sender.device.id();
@@ -280,7 +281,7 @@ impl Envelope {
         body.content.check()?;
         // 明文消息头里的撤回目标必须和加了密的正文一致。
         let inner_recall = match &body.content {
-            Content::Recall { target } => Some(target),
+            Content::Recall { target, .. } => Some(target),
             Content::Post { .. } | Content::Profile { .. } => None,
         };
         if inner_recall != self.recall.as_ref() {
@@ -334,6 +335,7 @@ mod tests {
                     size: 10,
                     name: "a.txt".into(),
                     mime: "text/plain".into(),
+                    sha256: None,
                 },
                 video: None,
             });
@@ -389,7 +391,7 @@ mod tests {
         let body = MessageBody {
             v: MESSAGE_VERSION,
             ctime_ms: 2,
-            content: Content::Recall { target: target.clone() },
+            content: Content::Recall { target_at: 1, target: target.clone() },
         };
         let envelope = Envelope::seal(&conv, MsgId::random(), 1, &seed, &sender, &body).unwrap();
         assert_eq!(envelope.recall, Some(target));
@@ -453,7 +455,7 @@ mod tests {
 
     fn video_part(cover: Option<FileRef>) -> Part {
         Part::File {
-            file: FileRef { id: FileId::random(), key: Fixed([5; 32]), size: 9_000_000, name: "clip.mp4".into(), mime: "video/mp4".into() },
+            file: FileRef { id: FileId::random(), key: Fixed([5; 32]), size: 9_000_000, name: "clip.mp4".into(), mime: "video/mp4".into(), sha256: None },
             video: Some(VideoInfo { cover, width: Some(1080), height: Some(1920), duration_ms: Some(3400) }),
         }
     }
@@ -466,7 +468,7 @@ mod tests {
         let conv = ConvId::random();
         let seed = ConvSeed::generate();
         let sender = Sender { uid: &uid, eldest: Fixed([1; 32]), device: &device };
-        let cover = FileRef { id: FileId::random(), key: Fixed([6; 32]), size: 40_000, name: "cover.jpg".into(), mime: "image/jpeg".into() };
+        let cover = FileRef { id: FileId::random(), key: Fixed([6; 32]), size: 40_000, name: "cover.jpg".into(), mime: "image/jpeg".into(), sha256: None };
         let post = |part: Part| MessageBody { v: MESSAGE_VERSION, ctime_ms: 1, content: Content::Post { parts: vec![part], reply_to: None } };
         let body = post(video_part(Some(cover.clone())));
         let envelope = Envelope::seal(&conv, MsgId::random(), 1, &seed, &sender, &body).unwrap();
@@ -499,7 +501,7 @@ mod tests {
     }
 
     fn photo(mime: &str, size: u64) -> FileRef {
-        FileRef { id: crate::ids::FileId::random(), key: Fixed([7; 32]), size, name: "avatar.png".into(), mime: mime.into() }
+        FileRef { id: crate::ids::FileId::random(), key: Fixed([7; 32]), size, name: "avatar.png".into(), mime: mime.into(), sha256: None }
     }
 
     // 契约 friend-im v6：个人资料带加密头像文件，照样加密签名、密文里找不到文件钥匙；旧版（只认 avatar 的写法）读到的是

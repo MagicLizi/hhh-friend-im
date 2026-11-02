@@ -15,8 +15,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use friend_im_core::bytes::Fixed;
+use friend_im_core::bytes::{Bytes, Fixed};
 use friend_im_core::ids::{ConvId, DeviceId, MsgId};
+use friend_im_core::reading::ReadingEnvelope;
 use friend_im_core::sync::{self, Index, Item, Key, Range, State};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,50 @@ pub enum PeerFrame {
     Deny {
         /// 会话。
         conv: ConvId,
+    },
+    /// 各设备的已读记录（设备签名、会话钥匙加密）。不进对账集合，每台设备取最新的一份。
+    Reading {
+        /// 会话。
+        conv: ConvId,
+        /// 记录。
+        records: Vec<ReadingEnvelope>,
+    },
+    /// 发送人的个人资料：不进对账集合，直接交给在线的会话成员，头像字节随帧带着。
+    Profile {
+        /// 会话。
+        conv: ConvId,
+        /// 个人资料消息的原件。
+        raw: String,
+        /// 头像字节。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        photo: Option<Bytes>,
+    },
+    /// 我要这个文件的这一段。
+    FileWant {
+        /// 请求编号（回复原样带回）。
+        req: u64,
+        /// 会话。
+        conv: ConvId,
+        /// 资源键。
+        key: String,
+        /// 从第几个字节。
+        offset: u64,
+        /// 要多少字节。
+        length: u64,
+    },
+    /// 文件的一段。
+    FileChunk {
+        /// 请求编号。
+        req: u64,
+        /// 这一段。
+        data: Bytes,
+        /// 文件总字节数。
+        total: u64,
+    },
+    /// 我这里没有这个文件。
+    FileMissing {
+        /// 请求编号。
+        req: u64,
     },
 }
 
@@ -139,11 +184,15 @@ pub enum Kind {
 }
 
 /// 权限与验签（插件按自己验过的账号与会话签名链回答）。
+#[allow(async_fn_in_trait)]
 pub trait Authority {
     /// 这台设备能不能和 `peer` 交换这个会话的东西：同账号，或双方都是会话的当前成员。
-    fn may_share(&self, conv: &ConvId, peer: &DeviceId) -> bool;
-    /// 验一份原件（消息原件或墓碑）；验不过返回 `None`（实现方记日志，不记正文）。
-    fn verify(&self, conv: &ConvId, raw: &str) -> Option<Verified>;
+    async fn may_share(&mut self, conv: &ConvId, peer: &DeviceId) -> bool;
+    /// 验一份原件（消息原件或墓碑）。验不过是 `Ok(None)`（实现方记日志，不记正文）；
+    /// 这会儿验不了（断网取不到签名链）是 `Err`，这一批先不处理，下一次对账再来。
+    async fn verify(&mut self, conv: &ConvId, raw: &str) -> Result<Option<Verified>, SyncError>;
+    /// 一份原件的编号（不验）：验不过的记下来，这一轮不再向别人要。
+    fn id_of(&self, raw: &str) -> Option<MsgId>;
     /// 由撤回原件生成被撤回那条的墓碑原件。
     fn tombstone(&self, conv: &ConvId, target: &Key, sender: &str, recall_raw: &str) -> String;
 }
@@ -182,12 +231,14 @@ pub struct Engine<S: Store, A: Authority> {
     indexes: HashMap<ConvId, Index>,
     online: HashSet<DeviceId>,
     outbox: Vec<(DeviceId, PeerFrame)>,
+    /// 这一轮验不过的编号：不再向别人要（比如重置账号后解不开的旧消息）。随 [`Engine::invalidate_all`] 清掉。
+    rejected: HashSet<MsgId>,
 }
 
 impl<S: Store, A: Authority> Engine<S, A> {
     /// 新引擎。索引在用到时从宿主建（进程重启后也从宿主重建）。
     pub fn new(store: S, auth: A) -> Self {
-        Self { store, auth, indexes: HashMap::new(), online: HashSet::new(), outbox: Vec::new() }
+        Self { store, auth, indexes: HashMap::new(), online: HashSet::new(), outbox: Vec::new(), rejected: HashSet::new() }
     }
 
     /// 取走要发的帧。
@@ -198,6 +249,11 @@ impl<S: Store, A: Authority> Engine<S, A> {
     /// 权限与验签（调用方更新签名链后可能要用）。
     pub fn auth(&self) -> &A {
         &self.auth
+    }
+
+    /// 同上，可改。
+    pub fn auth_mut(&mut self) -> &mut A {
+        &mut self.auth
     }
 
     /// 宿主存储。
@@ -215,9 +271,10 @@ impl<S: Store, A: Authority> Engine<S, A> {
         self.indexes.remove(conv);
     }
 
-    /// 丢掉全部索引。
+    /// 丢掉全部索引，验不过的记录也再给一次机会。
     pub fn invalidate_all(&mut self) {
         self.indexes.clear();
+        self.rejected.clear();
     }
 
     async fn index(&mut self, conv: &ConvId) -> Result<&mut Index, SyncError> {
@@ -242,10 +299,32 @@ impl<S: Store, A: Authority> Engine<S, A> {
         Ok(self.index(conv).await?.items().last().map(|item| item.key.at))
     }
 
+    /// 一条消息的排序键；宿主里没有（或是没有原件的旧消息）为空。
+    pub async fn key_of(&mut self, conv: &ConvId, id: &MsgId) -> Result<Option<Key>, SyncError> {
+        Ok(self.index(conv).await?.get(id).map(|item| item.key.clone()))
+    }
+
+    /// 现在在线、能交换这个会话的设备。
+    pub async fn sharing(&mut self, conv: &ConvId) -> Vec<DeviceId> {
+        let online: Vec<DeviceId> = self.online.iter().cloned().collect();
+        let mut peers = Vec::new();
+        for peer in online {
+            if self.auth.may_share(conv, &peer).await {
+                peers.push(peer);
+            }
+        }
+        peers
+    }
+
     /// 一台设备上线了（服务器推的在线状态，或局域网发现）：和它对一遍共享的会话。
     pub async fn peer_online(&mut self, peer: &DeviceId) -> Result<(), SyncError> {
         self.online.insert(peer.clone());
         self.sync_peer(peer).await
+    }
+
+    /// 记下一台在线设备，不发起对账（收到它的帧时）。
+    pub fn peer_seen(&mut self, peer: &DeviceId) {
+        self.online.insert(peer.clone());
     }
 
     /// 一台设备下线了。
@@ -253,10 +332,15 @@ impl<S: Store, A: Authority> Engine<S, A> {
         self.online.remove(peer);
     }
 
+    /// 自己和服务器断了：谁在线不知道了，连上后重新问。
+    pub fn clear_online(&mut self) {
+        self.online.clear();
+    }
+
     /// 和一台设备对一遍所有共享的会话。
     pub async fn sync_peer(&mut self, peer: &DeviceId) -> Result<(), SyncError> {
         for conv in self.store.conversations().await? {
-            if self.auth.may_share(&conv, peer) {
+            if self.auth.may_share(&conv, peer).await {
                 self.sync_with(peer, &conv).await?;
             }
         }
@@ -285,8 +369,7 @@ impl<S: Store, A: Authority> Engine<S, A> {
         let mut forward = Vec::new();
         self.apply(conv, None, std::slice::from_ref(&raw), &mut applied, &mut forward).await?;
         if applied.written > 0 {
-            let peers: Vec<DeviceId> = self.online.iter().filter(|peer| self.auth.may_share(conv, peer)).cloned().collect();
-            for peer in peers {
+            for peer in self.sharing(conv).await {
                 self.outbox.push((peer, PeerFrame::Have { conv: conv.clone(), records: vec![raw.clone()] }));
             }
         }
@@ -297,15 +380,15 @@ impl<S: Store, A: Authority> Engine<S, A> {
     pub async fn on_frame(&mut self, from: &DeviceId, frame: PeerFrame) -> Result<Applied, SyncError> {
         let mut applied = Applied::default();
         let conv = match &frame {
-            PeerFrame::Sync { conv, .. } | PeerFrame::Want { conv, .. } | PeerFrame::Have { conv, .. } | PeerFrame::Deny { conv } => conv.clone(),
+            PeerFrame::Sync { conv, .. } | PeerFrame::Want { conv, .. } | PeerFrame::Have { conv, .. } => conv.clone(),
+            // 别的帧不归对账管，由调用方处理。
+            _ => return Ok(applied),
         };
-        if let PeerFrame::Deny { .. } = frame {
-            return Ok(applied);
-        }
-        if !self.auth.may_share(&conv, from) {
+        if !self.auth.may_share(&conv, from).await {
             self.outbox.push((from.clone(), PeerFrame::Deny { conv }));
             return Ok(applied);
         }
+        self.online.insert(from.clone());
         match frame {
             PeerFrame::Sync { ranges, .. } => {
                 let outcome = match self.index(&conv).await?.respond(&ranges) {
@@ -316,7 +399,8 @@ impl<S: Store, A: Authority> Engine<S, A> {
                 if !outcome.have.is_empty() {
                     self.send_records(from, &conv, &outcome.have).await?;
                 }
-                for chunk in outcome.need.chunks(WANT_MAX) {
+                let need: Vec<MsgId> = outcome.need.into_iter().filter(|id| !self.rejected.contains(id)).collect();
+                for chunk in need.chunks(WANT_MAX) {
                     self.outbox.push((from.clone(), PeerFrame::Want { conv: conv.clone(), ids: chunk.to_vec() }));
                 }
                 if !outcome.done {
@@ -335,7 +419,7 @@ impl<S: Store, A: Authority> Engine<S, A> {
                     self.send_records(from, &conv, &forward).await?;
                 }
             }
-            PeerFrame::Deny { .. } => {}
+            _ => {}
         }
         Ok(applied)
     }
@@ -380,8 +464,19 @@ impl<S: Store, A: Authority> Engine<S, A> {
         // 这一批里已经决定要写、还没写进宿主的原件：后面的核对先看这里。
         let mut pending: HashMap<MsgId, String> = HashMap::new();
         for raw in records {
-            let Some(verified) = self.auth.verify(conv, raw) else {
+            let verified = match self.auth.verify(conv, raw).await {
+                Ok(verified) => verified,
+                Err(error) => {
+                    // 这会儿验不了：这一批没写的下次对账再来，已经决定写的先写掉。
+                    self.flush(conv, writes, applied).await?;
+                    return Err(error);
+                }
+            };
+            let Some(verified) = verified else {
                 applied.rejected += 1;
+                if let Some(id) = self.auth.id_of(raw) {
+                    self.rejected.insert(id);
+                }
                 continue;
             };
             match &verified.kind {
@@ -442,6 +537,10 @@ impl<S: Store, A: Authority> Engine<S, A> {
                 }
             }
         }
+        self.flush(conv, writes, applied).await
+    }
+
+    async fn flush(&mut self, conv: &ConvId, writes: Vec<Write>, applied: &mut Applied) -> Result<(), SyncError> {
         if writes.is_empty() {
             return Ok(());
         }
@@ -456,8 +555,10 @@ impl<S: Store, A: Authority> Engine<S, A> {
 
     /// 墓碑里记下的撤回者与撤回者写的目标排序键。
     async fn claimed(&mut self, conv: &ConvId, id: &MsgId, pending: &HashMap<MsgId, String>) -> Result<Option<(String, Key)>, SyncError> {
-        let raw = self.raw_of(conv, id, pending).await?;
-        Ok(raw.and_then(|raw| self.auth.verify(conv, &raw)).and_then(|v| match v.kind {
+        let Some(raw) = self.raw_of(conv, id, pending).await? else {
+            return Ok(None);
+        };
+        Ok(self.auth.verify(conv, &raw).await?.and_then(|v| match v.kind {
             Kind::Recall { target } => Some((v.sender, target)),
             Kind::Post => None,
         }))
@@ -465,8 +566,10 @@ impl<S: Store, A: Authority> Engine<S, A> {
 
     /// 本机存的原文验出来的发送者与排序键。
     async fn original(&mut self, conv: &ConvId, id: &MsgId, pending: &HashMap<MsgId, String>) -> Result<Option<Verified>, SyncError> {
-        let raw = self.raw_of(conv, id, pending).await?;
-        Ok(raw.and_then(|raw| self.auth.verify(conv, &raw)).filter(|v| v.kind == Kind::Post))
+        let Some(raw) = self.raw_of(conv, id, pending).await? else {
+            return Ok(None);
+        };
+        Ok(self.auth.verify(conv, &raw).await?.filter(|v| v.kind == Kind::Post))
     }
 
     async fn raw_of(&mut self, conv: &ConvId, id: &MsgId, pending: &HashMap<MsgId, String>) -> Result<Option<String>, SyncError> {

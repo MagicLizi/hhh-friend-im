@@ -41,6 +41,9 @@ pub(crate) struct Stint {
     pub eldest: Fixed<32>,
     pub from: u64,
     pub until: Option<u64>,
+    /// 同一段身份按签名链里写的时间：和消息的发送时间比（消息不再有服务器日志序号）。
+    pub from_ms: i64,
+    pub until_ms: Option<i64>,
 }
 
 /// 一个会话：验过的现状 + 原始的环（翻历史时合进系统提示）+ 成员身份区间。
@@ -54,43 +57,65 @@ pub(crate) struct ConvRecord {
 }
 
 impl ConvRecord {
-    /// 某人在日志位置 `log` 时是不是这个身份的成员。
-    pub fn member_at(&self, uid: &Uid, eldest: &Fixed<32>, log: u64) -> bool {
-        self.stints
-            .iter()
-            .any(|s| &s.uid == uid && &s.eldest == eldest && s.from <= log && s.until.is_none_or(|until| log < until))
+    /// 这个身份在日志区间 `[start, end)` 里是不是当过成员（`end` 为空到现在）。
+    pub fn member_during(&self, uid: &Uid, eldest: &Fixed<32>, start: u64, end: Option<u64>) -> bool {
+        self.stints.iter().any(|s| {
+            &s.uid == uid && &s.eldest == eldest && end.is_none_or(|end| s.from < end) && s.until.is_none_or(|until| until > start)
+        })
     }
 
-    fn open_stint(&mut self, member: &MemberRef, log: u64) {
+    /// 第 `generation` 代钥匙在用的日志区间：从这一代出现，到下一代出现（还在用为空）。
+    pub fn generation_window(&self, generation: u32) -> Option<(u64, Option<u64>)> {
+        let mut current = 0;
+        let mut start = None;
+        for (link, log) in &self.links {
+            let body = link.parse().ok()?;
+            if matches!(body.change, ConvChange::Create { .. } | ConvChange::Rotate { .. } | ConvChange::MemberReset { .. }) {
+                current += 1;
+                if current == generation {
+                    start = Some(*log);
+                } else if current == generation + 1 {
+                    return Some((start?, Some(*log)));
+                }
+            }
+        }
+        start.map(|start| (start, None))
+    }
+
+    fn open_stint(&mut self, member: &MemberRef, log: u64, at: i64) {
         self.stints.push(Stint {
             uid: member.uid.clone(),
             eldest: member.eldest,
             from: log,
             until: None,
+            from_ms: at,
+            until_ms: None,
         });
     }
 
-    fn close_stint(&mut self, uid: &Uid, log: u64) {
+    fn close_stint(&mut self, uid: &Uid, log: u64, at: i64) {
         for stint in self.stints.iter_mut().filter(|s| &s.uid == uid && s.until.is_none()) {
             stint.until = Some(log);
+            stint.until_ms = Some(at);
         }
     }
 
     /// 记下已验过的一环带来的成员区间与邀请代数变化。
     fn record(&mut self, link: &ConvLink, log: u64) {
         let Ok(body) = link.parse() else { return };
+        let at = body.ctime_ms;
         match &body.change {
             ConvChange::Create { members, .. } | ConvChange::Add { members } => {
                 for m in members {
-                    self.open_stint(m, log);
+                    self.open_stint(m, log, at);
                 }
             }
-            ConvChange::JoinByInvite { member, .. } => self.open_stint(member, log),
-            ConvChange::Remove { uid, .. } => self.close_stint(uid, log),
-            ConvChange::Leave => self.close_stint(&body.author, log),
+            ConvChange::JoinByInvite { member, .. } => self.open_stint(member, log, at),
+            ConvChange::Remove { uid, .. } => self.close_stint(uid, log, at),
+            ConvChange::Leave => self.close_stint(&body.author, log, at),
             ConvChange::MemberReset { member, .. } => {
-                self.close_stint(&member.uid, log);
-                self.open_stint(member, log);
+                self.close_stint(&member.uid, log, at);
+                self.open_stint(member, log, at);
             }
             ConvChange::CreateInvite { invite, .. } => {
                 self.invite_generations.insert(invite.clone(), self.state.current_key().generation);
@@ -215,6 +240,25 @@ impl Book {
         self.load_account(conn, uid, Some(epoch)).await?;
         self.device(uid, eldest, device, log)
             .ok_or_else(|| ClientError::verify("签名的电脑不属于这个账号，或当时已被移除"))
+    }
+
+    fn device_during(&self, uid: &Uid, eldest: &Fixed<32>, device: &DeviceId, start: u64, end: Option<u64>) -> Option<DevicePublic> {
+        let record = self.accounts.get(uid)?.epochs.values().find(|s| &s.eldest == eldest)?.devices.get(device)?;
+        let in_window = end.is_none_or(|end| record.added.log < end) && record.removed.as_ref().is_none_or(|removed| removed.log > start);
+        in_window.then_some(record.keys)
+    }
+
+    /// 确保某账号某身份的电脑在日志区间 `[start, end)` 里有效过，返回它的公钥；缓存里没有就补取一次。
+    pub async fn ensure_device_during(&mut self, conn: &Conn, uid: &Uid, eldest: &Fixed<32>, device: &DeviceId, start: u64, end: Option<u64>) -> Result<DevicePublic> {
+        if let Some(key) = self.device_during(uid, eldest, device, start, end) {
+            return Ok(key);
+        }
+        let epoch = self.ensure_identity(conn, uid, eldest).await?;
+        if let Some(key) = self.device_during(uid, eldest, device, start, end) {
+            return Ok(key);
+        }
+        self.load_account(conn, uid, Some(epoch)).await?;
+        self.device_during(uid, eldest, device, start, end).ok_or_else(|| ClientError::verify("签名的电脑不属于这个账号，或当时已被移除"))
     }
 
     /// 校验一环之前把需要的签名链准备好：签名人当时的电脑、被“因重置移出”的人的当前一轮。

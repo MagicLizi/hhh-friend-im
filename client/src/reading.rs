@@ -1,11 +1,13 @@
-//! 阅读查询不写状态；本人明确查看时，才写设备签名的加密边界。
+//! 已读记录：设备签名、会话钥匙加密，设备之间对账时互相交换，服务器不存。
+//!
+//! 每台设备一份，取版本最大的那份。只在内存里：重启后别的设备的记录从在线伙伴补回，补回前保持未知。
 use crate::{Client, ClientError, Message, Result, conn::Conn, state::State};
 use friend_im_core::{
     bytes::Fixed,
     ids::{ConvId, DeviceId, MsgId, Uid},
     message::{Content, Sender},
-    reading::{ReadingBody, ReadingEnvelope, StoredReading},
-    wire::{ErrorCode, Request, Response, WireError},
+    reading::{ReadingBody, ReadingEnvelope},
+    sync::Key,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -24,250 +26,135 @@ pub enum ReadingMark {
     Unknown,
 }
 
+#[derive(Clone)]
 struct Verified {
-    record: StoredReading,
-    // 重置后旧私钥已经丢弃。签名头仍可用于 CAS，旧密文不能当成阅读事实。
+    envelope: ReadingEnvelope,
+    // 重置后旧私钥已经丢弃、或拿不到那一代钥匙：版本照记，但不当成阅读事实。
     body: Option<ReadingBody>,
 }
+
+/// 一个会话至多记多少份（账号数 × 设备数）。
 const RECORDS_MAX: usize = 20_000;
 
-fn unsupported() -> ClientError {
-    ClientError::Server(WireError {
-        code: ErrorCode::Unsupported,
-        message: "当前服务器尚未提供阅读扩展，聊天仍可使用".into(),
-    })
+/// 内存里的已读记录：会话 → 设备 → 最新一份。
+#[derive(Default)]
+pub(crate) struct ReadingBook {
+    records: HashMap<ConvId, HashMap<DeviceId, Verified>>,
 }
 
-/// 服务端按会话、账号和设备保存 CAS 版本。重置身份保留设备钥匙时，
-/// 旧身份的阅读边界不能继承，但同一行的版本必须继续递增。
-fn next_revision(records: &[Verified], uid: &Uid, device: &DeviceId) -> Result<u64> {
-    records
-        .iter()
-        .filter(|r| &r.record.envelope.reader == uid && &r.record.envelope.device == device)
-        .map(|r| r.record.envelope.revision)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| ClientError::state("阅读版本已到上限"))
+fn key_of(body: &ReadingBody) -> Key {
+    Key { at: body.at, id: body.message.clone() }
 }
 
 impl State {
-    fn require_reading(&self) -> Result<()> {
-        self.require_active()?;
-        if !self.reading {
-            return Err(unsupported());
+    /// 验一份记录：读者当时是成员、设备当时有效、签名对。
+    async fn reading_verify(&mut self, conn: &Conn, conv: &ConvId, envelope: ReadingEnvelope) -> Result<Verified> {
+        if &envelope.conv != conv {
+            return Err(ClientError::verify("阅读记录不是这个会话的"));
         }
-        Ok(())
-    }
-
-    async fn reading_messages(
-        &mut self,
-        conn: &Conn,
-        conv: &ConvId,
-        ids: &[MsgId],
-    ) -> Result<Vec<Message>> {
-        self.require_reading()?;
-        if ids.len() > 100 {
-            return Err(ClientError::state("一次最多核对 100 条消息"));
+        let (start, end) = self.generation_window(conn, conv, envelope.generation).await?;
+        let record = self.book.conv(conn, conv).await?;
+        if !record.member_during(&envelope.reader, &envelope.reader_eldest, start, end) {
+            return Err(ClientError::verify("阅读人当时不是这个身份的成员"));
         }
-        let Response::ReadingMessages { messages } = conn
-            .request(Request::ReadingMessages {
-                conv: conv.clone(),
-                ids: ids.to_vec(),
-            })
-            .await?
-        else {
-            return Err(ClientError::protocol("阅读消息回执不正确"));
-        };
-        let mut seen = HashSet::new();
-        if messages.len() > ids.len()
-            || messages.iter().any(|m| {
-                &m.env.conv != conv || !ids.contains(&m.env.id) || !seen.insert(m.env.id.clone())
-            })
-        {
-            return Err(ClientError::verify("阅读消息范围不一致"));
-        }
-        let mut result = Vec::with_capacity(messages.len());
-        for message in messages {
-            result.push(self.open_message(conn, &message).await?);
-        }
-        Ok(result)
-    }
-
-    async fn reading_records(
-        &mut self,
-        conn: &Conn,
-        conv: &ConvId,
-        own_only: bool,
-    ) -> Result<Vec<Verified>> {
-        self.require_reading()?;
-        self.book.load_conv(conn, conv).await?;
+        let device = self.book.ensure_device_during(conn, &envelope.reader, &envelope.reader_eldest, &envelope.device, start, end).await?;
+        envelope.verify(&device)?;
         let me = self.my_ref(conn).await?;
-        let generation = self.book.convs[conv].state.current_key().generation;
-        let mut after = 0;
-        let mut records = Vec::new();
-        loop {
-            let Response::ReadingPage {
-                records: page,
-                more,
-            } = conn
-                .request(Request::ReadingGet {
-                    conv: conv.clone(),
-                    after,
-                    limit: 200,
-                })
-                .await?
-            else {
-                return Err(ClientError::protocol("阅读分页回执不正确"));
-            };
-            if page.len() > 200
-                || (more && page.is_empty())
-                || records.len() + page.len() > RECORDS_MAX
-            {
-                return Err(ClientError::protocol("阅读分页超过边界"));
+        let body = if envelope.reader == self.uid && envelope.reader_eldest != me.eldest {
+            None
+        } else {
+            match self.optional_conv_seed(conn, conv, envelope.generation).await {
+                Ok(Some(seed)) => Some(envelope.open(&seed, &device)?),
+                // 不把拿不到旧钥匙误报成未读，也不让旧记录阻断新身份的同步。
+                Ok(None) | Err(ClientError::Verify(_)) => None,
+                Err(error) => return Err(error),
             }
-            for record in page {
-                if record.log <= after
-                    || record.log > i64::MAX as u64
-                    || &record.envelope.conv != conv
-                {
-                    return Err(ClientError::verify("阅读分页范围不一致"));
-                }
-                after = record.log;
-                records.push(record);
-            }
-            if !more {
-                break;
-            }
-        }
-        let mut result = Vec::with_capacity(records.len());
-        for record in records {
-            let envelope = &record.envelope;
-            if own_only && envelope.reader != self.uid {
+        };
+        Ok(Verified { envelope, body })
+    }
+
+    /// 并进别的设备发来的记录，每台设备留版本最大的。有变化返回真。
+    pub(crate) async fn reading_merge(&mut self, conn: &Conn, conv: &ConvId, incoming: Vec<ReadingEnvelope>) -> Result<bool> {
+        let mut changed = false;
+        for envelope in incoming {
+            let known = self.readings.records.get(conv).and_then(|records| records.get(&envelope.device)).map(|v| v.envelope.revision);
+            if known.is_some_and(|revision| revision >= envelope.revision) {
                 continue;
             }
-            if !self.book.convs[conv].member_at(
-                &envelope.reader,
-                &envelope.reader_eldest,
-                record.log,
-            ) {
-                return Err(ClientError::verify("阅读人当时不是这个身份的成员"));
-            }
-            let device = self
-                .book
-                .ensure_device(
-                    conn,
-                    &envelope.reader,
-                    &envelope.reader_eldest,
-                    &envelope.device,
-                    record.log,
-                )
-                .await?;
-            envelope.verify(&device)?;
-            let body = if envelope.reader == self.uid && envelope.reader_eldest != me.eldest {
-                None
-            } else if let Some(seed) = self
-                .optional_conv_seed(conn, conv, envelope.generation)
-                .await?
-            {
-                Some(envelope.open(&seed, &device)?)
-            } else if envelope.generation < generation {
-                // 不把拿不到旧钥匙误报成未读，也不让旧记录阻断新身份的同步。
-                None
-            } else {
-                return Err(ClientError::verify("拿不到当前阅读记录的会话钥匙"));
+            let verified = match self.reading_verify(conn, conv, envelope).await {
+                Ok(verified) => verified,
+                Err(error @ (ClientError::Disconnected | ClientError::Timeout)) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%conv, %error, "一份阅读记录验不过，丢掉");
+                    continue;
+                }
             };
-            if body.as_ref().is_some_and(|b| b.through >= record.log) {
-                return Err(ClientError::verify("阅读记录早于它声称读到的消息"));
+            let records = self.readings.records.entry(conv.clone()).or_default();
+            if records.len() >= RECORDS_MAX && !records.contains_key(&verified.envelope.device) {
+                tracing::warn!(%conv, "阅读记录到上限了，新的不记");
+                continue;
             }
-            result.push(Verified { record, body });
+            records.insert(verified.envelope.device.clone(), verified);
+            changed = true;
         }
-        // 水位必须能对应回同一会话里真实存在、验签通过的确切消息。
-        let ids: Vec<_> = result
-            .iter()
-            .filter_map(|v| v.body.as_ref().map(|b| b.message.clone()))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let mut boundaries = HashMap::new();
-        for batch in ids.chunks(100) {
-            for message in self.reading_messages(conn, conv, batch).await? {
-                boundaries.insert(message.id, message.log);
-            }
-        }
-        if result
-            .iter()
-            .filter_map(|v| v.body.as_ref())
-            .any(|b| boundaries.get(&b.message) != Some(&b.through))
-        {
-            return Err(ClientError::verify("阅读水位与确切消息对不上"));
-        }
-        Ok(result)
+        Ok(changed)
     }
 
-    async fn reading_through(&mut self, conn: &Conn, conv: &ConvId) -> Result<Option<u64>> {
-        let records = self.reading_records(conn, conv, true).await?;
+    /// 这个会话的全部记录（对账时交给对方）。
+    pub(crate) fn reading_records(&self, conv: &ConvId) -> Vec<ReadingEnvelope> {
+        self.readings.records.get(conv).map(|records| records.values().map(|v| v.envelope.clone()).collect()).unwrap_or_default()
+    }
+
+    /// 本人（当前身份）读到哪里。
+    async fn reading_through(&mut self, conn: &Conn, conv: &ConvId) -> Result<Option<Key>> {
         let me = self.my_ref(conn).await?;
-        Ok(records
-            .iter()
-            .filter(|r| {
-                r.record.envelope.reader == self.uid && r.record.envelope.reader_eldest == me.eldest
-            })
-            .filter_map(|r| r.body.as_ref().map(|b| b.through))
+        Ok(self
+            .readings
+            .records
+            .get(conv)
+            .into_iter()
+            .flat_map(|records| records.values())
+            .filter(|v| v.envelope.reader == self.uid && v.envelope.reader_eldest == me.eldest)
+            .filter_map(|v| v.body.as_ref().map(key_of))
             .max())
     }
 
-    async fn reading_receipts(
-        &mut self,
-        conn: &Conn,
-        conv: &ConvId,
-        ids: &[MsgId],
-    ) -> Result<Vec<MessageReceipt>> {
-        let records = self.reading_records(conn, conv, false).await?;
-        let mut positions: HashMap<(Uid, Fixed<32>), u64> = HashMap::new();
+    async fn reading_receipts(&mut self, conn: &Conn, conv: &ConvId, messages: &[Message]) -> Result<Vec<MessageReceipt>> {
+        self.book.load_conv(conn, conv).await?;
+        let mut positions: HashMap<(Uid, Fixed<32>), Key> = HashMap::new();
         let mut unknown = HashSet::new();
-        for record in records {
-            let key = (
-                record.record.envelope.reader,
-                record.record.envelope.reader_eldest,
-            );
-            if let Some(body) = record.body {
-                positions
-                    .entry(key)
-                    .and_modify(|p| *p = (*p).max(body.through))
-                    .or_insert(body.through);
-            } else {
-                unknown.insert(key);
+        for record in self.readings.records.get(conv).into_iter().flat_map(|r| r.values()) {
+            let who = (record.envelope.reader.clone(), record.envelope.reader_eldest);
+            match &record.body {
+                Some(body) => {
+                    let key = key_of(body);
+                    positions.entry(who).and_modify(|p| *p = (*p).clone().max(key.clone())).or_insert(key);
+                }
+                None => {
+                    unknown.insert(who);
+                }
             }
         }
-        let messages = self.reading_messages(conn, conv, ids).await?;
         let mut result = Vec::new();
         for message in messages {
-            if message.sender != self.uid || !matches!(message.content, Some(Content::Post { .. }))
-            {
+            if message.sender != self.uid || !matches!(message.content, Content::Post { .. }) {
                 continue;
             }
+            let at = message.ctime_ms;
+            // 回执名单：消息发出时在群里的人。
             let mut recipients: Vec<_> = self.book.convs[conv]
                 .stints
                 .iter()
-                .filter(|s| {
-                    s.uid != self.uid
-                        && s.from <= message.log
-                        && s.until.is_none_or(|until| message.log < until)
-                })
+                .filter(|s| s.uid != self.uid && s.from_ms <= at && s.until_ms.is_none_or(|until| at < until))
                 .map(|s| (s.uid.clone(), s.eldest))
                 .collect();
             recipients.sort_by(|a, b| a.0.cmp(&b.0));
             recipients.dedup();
-            let mut receipt = MessageReceipt {
-                message: message.id,
-                readers: Vec::new(),
-                unreaders: Vec::new(),
-                complete: true,
-            };
+            let key = Key { at, id: message.id.clone() };
+            let mut receipt = MessageReceipt { message: message.id.clone(), readers: Vec::new(), unreaders: Vec::new(), complete: true };
             for (uid, eldest) in recipients {
                 match positions.get(&(uid.clone(), eldest)) {
-                    Some(through) if *through >= message.log => receipt.readers.push(uid),
+                    Some(through) if *through >= key => receipt.readers.push(uid),
                     _ if unknown.contains(&(uid.clone(), eldest)) => receipt.complete = false,
                     Some(_) => receipt.unreaders.push(uid),
                     None => receipt.complete = false,
@@ -278,156 +165,53 @@ impl State {
         Ok(result)
     }
 
-    async fn reading_mark(
-        &mut self,
-        conn: &Conn,
-        conv: &ConvId,
-        id: &MsgId,
-        position: Option<u64>,
-    ) -> Result<ReadingMark> {
-        self.require_reading()?;
-        let message = self
-            .reading_messages(conn, conv, std::slice::from_ref(id))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| ClientError::state("这条消息不存在"))?;
-        if !matches!(message.content, Some(Content::Post { .. }))
-            || position.is_some_and(|p| p != message.log)
-        {
-            return Err(ClientError::state("阅读边界与消息不一致"));
+    /// 写本设备新的一份。已经读到更后面了就不写，返回 `None`。
+    async fn reading_mark(&mut self, conn: &Conn, conv: &ConvId, message: &Message) -> Result<Option<ReadingEnvelope>> {
+        self.require_active()?;
+        if !matches!(message.content, Content::Post { .. }) {
+            return Err(ClientError::state("阅读边界不是一条消息"));
         }
-        let records = self.reading_records(conn, conv, true).await?;
+        let key = Key { at: message.ctime_ms, id: message.id.clone() };
+        if self.reading_through(conn, conv).await?.is_some_and(|through| through >= key) {
+            return Ok(None);
+        }
         let me = self.my_ref(conn).await?;
-        let own: Vec<_> = records
-            .iter()
-            .filter(|r| {
-                r.record.envelope.reader == self.uid && r.record.envelope.reader_eldest == me.eldest
-            })
-            .collect();
-        if own
-            .iter()
-            .any(|r| r.body.as_ref().is_some_and(|b| b.through >= message.log))
-        {
-            return Ok(ReadingMark::Applied);
-        }
-        let revision = next_revision(&records, &self.uid, &self.creds.device.id())?;
-        let generation = self.book.convs[conv].state.current_key().generation;
+        let device = self.creds.device.id();
+        let last = self.readings.records.get(conv).and_then(|records| records.get(&device)).map_or(0, |v| v.envelope.revision);
+        // 版本用时间：插件重启后内存清空，新写的一份也要比别的设备手里的那份新。
+        let revision = (self.now_ms().max(1) as u64).max(last + 1);
+        let generation = self.book.conv(conn, conv).await?.state.current_key().generation;
         let seed = self.conv_seed(conn, conv, generation).await?;
-        let envelope = ReadingEnvelope::seal(
-            conv,
-            generation,
-            revision,
-            &seed,
-            &Sender {
-                uid: &self.uid,
-                eldest: me.eldest,
-                device: &self.creds.device,
-            },
-            &ReadingBody {
-                through: message.log,
-                message: id.clone(),
-            },
-        )?;
-        match conn.request(Request::ReadingSet { envelope }).await {
-            Ok(Response::ReadingSaved { .. }) => {}
-            Ok(_) | Err(ClientError::Disconnected | ClientError::Timeout) => {
-                return Ok(ReadingMark::Unknown);
-            }
-            Err(error) if error.code() == Some(ErrorCode::Conflict) => {}
-            Err(error) => return Err(error),
-        }
-        // 成功、冲突或响应不确定都不重放写入，只读核对能证明的边界。
-        match self.reading_through(conn, conv).await {
-            Ok(Some(through)) if through >= message.log => Ok(ReadingMark::Applied),
-            _ => Ok(ReadingMark::Unknown),
-        }
+        let body = ReadingBody { at: key.at, message: key.id };
+        let envelope = ReadingEnvelope::seal(conv, generation, revision, &seed, &Sender { uid: &self.uid, eldest: me.eldest, device: &self.creds.device }, &body)?;
+        self.readings.records.entry(conv.clone()).or_default().insert(device, Verified { envelope: envelope.clone(), body: Some(body) });
+        Ok(Some(envelope))
     }
 }
 
 impl Client {
-    pub async fn supports_reading(&self) -> bool {
-        self.inner.state.lock().await.reading
-    }
-    pub async fn reading_through(&self, conv: &ConvId) -> Result<Option<u64>> {
-        self.call(async |s, c| s.reading_through(c, conv).await)
-            .await
-    }
-    pub async fn reading_receipts(
-        &self,
-        conv: &ConvId,
-        ids: &[MsgId],
-    ) -> Result<Vec<MessageReceipt>> {
-        self.call(async |s, c| s.reading_receipts(c, conv, ids).await)
-            .await
-    }
-    pub async fn mark_read(
-        &self,
-        conv: &ConvId,
-        id: &MsgId,
-        position: Option<u64>,
-    ) -> Result<ReadingMark> {
-        self.call(async |s, c| s.reading_mark(c, conv, id, position).await)
-            .await
-    }
-    pub async fn reading_messages(&self, conv: &ConvId, ids: &[MsgId]) -> Result<Vec<Message>> {
-        self.call(async |s, c| s.reading_messages(c, conv, ids).await)
-            .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use friend_im_core::keys::{ConvSeed, DeviceSecret};
-
-    fn record(
-        conv: &ConvId,
-        uid: &Uid,
-        device: &DeviceSecret,
-        eldest: u8,
-        revision: u64,
-    ) -> Verified {
-        let body = ReadingBody {
-            through: 1,
-            message: MsgId::random(),
-        };
-        let envelope = ReadingEnvelope::seal(
-            conv,
-            1,
-            revision,
-            &ConvSeed::generate(),
-            &Sender {
-                uid,
-                eldest: Fixed([eldest; 32]),
-                device,
-            },
-            &body,
-        )
-        .unwrap();
-        Verified {
-            record: StoredReading { log: 2, envelope },
-            body: Some(body),
-        }
+    /// 本人读到哪里（排序键）；还不知道为空。
+    pub async fn reading_through(&self, conv: &ConvId) -> Result<Option<Key>> {
+        self.call_any(async |s, c| s.reading_through(c, conv).await).await
     }
 
-    #[test]
-    fn same_device_keeps_its_revision_after_identity_reset() {
-        let conv = ConvId::random();
-        let me = Uid::random();
-        let other = Uid::random();
-        let device = DeviceSecret::generate();
-        let other_device = DeviceSecret::generate();
-        // 本设备仍只有旧身份记录；新身份在另一设备的版本和别人的版本
-        // 都不属于本设备的 CAS 行，不能替代或重置旧版本 5。
-        let mut records = vec![
-            record(&conv, &me, &device, 1, 5),
-            record(&conv, &me, &other_device, 2, 90),
-            record(&conv, &other, &device, 2, 70),
-        ];
-        // 重置后旧密文解不开，但已验签的版本号仍必须参与 CAS。
-        records[0].body = None;
-        assert_eq!(next_revision(&records, &me, &device.id()).unwrap(), 6);
-        assert_eq!(next_revision(&[], &me, &device.id()).unwrap(), 1);
+    /// 这些消息的阅读回执（只算自己发的）。
+    pub async fn reading_receipts(&self, conv: &ConvId, messages: &[Message]) -> Result<Vec<MessageReceipt>> {
+        self.call_any(async |s, c| s.reading_receipts(c, conv, messages).await).await
+    }
+
+    /// 写本设备的已读位置；返回要交给别的设备的新记录（已经读到更后面了为空）。
+    pub async fn mark_read(&self, conv: &ConvId, message: &Message) -> Result<Option<ReadingEnvelope>> {
+        self.call_any(async |s, c| s.reading_mark(c, conv, message).await).await
+    }
+
+    /// 并进别的设备发来的记录，有变化返回真。
+    pub async fn merge_reading(&self, conv: &ConvId, records: Vec<ReadingEnvelope>) -> Result<bool> {
+        self.call_any(async |s, c| s.reading_merge(c, conv, records).await).await
+    }
+
+    /// 这个会话手里的全部记录。
+    pub async fn reading_records(&self, conv: &ConvId) -> Vec<ReadingEnvelope> {
+        self.inner.state.lock().await.reading_records(conv)
     }
 }

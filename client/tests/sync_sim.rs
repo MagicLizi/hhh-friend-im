@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use friend_im_client::core::ids::{ConvId, DeviceId, MsgId};
 use friend_im_client::core::sync::{Key, next_at, raw_digest};
-use friend_im_client::sync::{Authority, Engine, Kind, PeerFrame, Store, StoredItem, StoredRecord, Verified, Write};
+use friend_im_client::sync::{Authority, Engine, Kind, PeerFrame, Store, StoredItem, StoredRecord, SyncError, Verified, Write};
 use serde::{Deserialize, Serialize};
 
 /// 修过的失败种子（永久回归）。
@@ -124,7 +124,7 @@ impl SimAuth {
 }
 
 impl Authority for SimAuth {
-    fn may_share(&self, conv: &ConvId, peer: &DeviceId) -> bool {
+    async fn may_share(&mut self, conv: &ConvId, peer: &DeviceId) -> bool {
         let truth = self.truth.borrow();
         let (Some(mine), Some(theirs)) = (truth.owner.get(&self.me), truth.owner.get(peer)) else {
             return false;
@@ -135,7 +135,21 @@ impl Authority for SimAuth {
         truth.members.get(conv).is_some_and(|members| members.contains(mine) && members.contains(theirs))
     }
 
-    fn verify(&self, conv: &ConvId, raw: &str) -> Option<Verified> {
+    fn id_of(&self, raw: &str) -> Option<MsgId> {
+        serde_json::from_str::<SimRecord>(raw).ok().map(|record| record.id)
+    }
+
+    async fn verify(&mut self, conv: &ConvId, raw: &str) -> Result<Option<Verified>, SyncError> {
+        Ok(self.check(conv, raw))
+    }
+
+    fn tombstone(&self, _conv: &ConvId, target: &Key, sender: &str, recall_raw: &str) -> String {
+        serde_json::to_string(&SimTomb { tomb: target.clone(), sender: sender.to_owned(), recall: recall_raw.to_owned() }).unwrap()
+    }
+}
+
+impl SimAuth {
+    fn check(&self, conv: &ConvId, raw: &str) -> Option<Verified> {
         if let Ok(tomb) = serde_json::from_str::<SimTomb>(raw) {
             let recall = self.verify_record(conv, &tomb.recall)?;
             let target = recall.recall.clone()?;
@@ -156,10 +170,6 @@ impl Authority for SimAuth {
             Some(target) => Some(Verified { key, sender, kind: Kind::Recall { target }, recall_raw: Some(raw.to_owned()) }),
             None => Some(Verified { key, sender, kind: Kind::Post, recall_raw: None }),
         }
-    }
-
-    fn tombstone(&self, _conv: &ConvId, target: &Key, sender: &str, recall_raw: &str) -> String {
-        serde_json::to_string(&SimTomb { tomb: target.clone(), sender: sender.to_owned(), recall: recall_raw.to_owned() }).unwrap()
     }
 }
 

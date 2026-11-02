@@ -8,10 +8,11 @@
 //!    或 `{"t":"err","id":n,"err":{"code":...,"message":...}}`。
 //! 4. 服务器随时可能主动推送 `{"t":"push","push":{"kind":...}}`。
 //!
-//! 文件内容不走 WebSocket，按段走 HTTPS（`PUT` / `HEAD` / `GET /v1/files/{编号}`，带登录凭证）。
-//!
-//! 同步：服务器给每条消息、撤回、会话签名链变化、钥匙封装、账号签名链变化一个全局递增的日志序号。
+//! 控制面（账号、设备、成员、钥匙、好友申请）由服务器保存：会话签名链变化、钥匙封装、账号签名链变化有全局递增的日志序号，
 //! 电脑在线时服务器直接推；重连后带上次的序号补拉（[`Request::Sync`]），不漏不重。
+//!
+//! 数据面（消息、文件、已读）服务器一概不存：设备之间互相对账，帧是端到端加密的 [`SealedFrame`]。不能局域网直连时，
+//! 服务器只在内存里转交给当时在线的设备（[`Request::Relay`]），对方不在线就回“不在线”，不排队。
 
 use serde::{Deserialize, Serialize};
 
@@ -20,13 +21,12 @@ use crate::bytes::{Bytes, Fixed};
 use crate::conv::{ConvKind, ConvLink};
 use crate::crypto::{self, Sealed, ctx};
 use crate::error::Result;
-use crate::ids::{ConvId, DeviceId, FileId, InviteId, MsgId, RequestId, Uid};
+use crate::ids::{ConvId, DeviceId, InviteId, RequestId, Uid};
 use crate::keys::{DevicePublic, DeviceSecret};
-use crate::message::Envelope;
-use crate::reading::{ReadingEnvelope, StoredReading};
+use crate::peer::SealedFrame;
 
 /// 接口版本。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 客户端发的一帧。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,50 +414,6 @@ pub enum Request {
         /// 封装给自己账号钥匙的会话种子。
         keys: ConvKeyBundle,
     },
-    /// 发消息（按会话与消息编号去重：同一条重发返回同一个序号）。
-    Send {
-        /// 信封。
-        env: Envelope,
-    },
-    /// 直连发送的第一步：只落库，暂不向任何在线电脑推送。
-    ///
-    /// 客户端随后把服务器返回的日志序号提交给已经完成局域网暂存的电脑，
-    /// 再用 [`ReleaseMessage`] 向没有直连成功的电脑补发。
-    SendLan {
-        /// 信封。
-        env: Envelope,
-    },
-    /// 释放一条已落库的直连消息，跳过已经由局域网提交的电脑。
-    ReleaseMessage {
-        /// 会话。
-        conv: ConvId,
-        /// 消息编号。
-        id: MsgId,
-        /// 已经由局域网收到的电脑。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        direct_devices: Vec<DeviceId>,
-    },
-    /// 按会话往前翻历史（`before` 为空从最新开始）。
-    History {
-        /// 会话。
-        conv: ConvId,
-        /// 取日志序号小于它的。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        before: Option<u64>,
-        /// 最多几条。
-        limit: u32,
-        /// 只要服务器时间不早于它的（毫秒，含）。第 1 版之后加的可选字段：不带时与旧帧一字不差。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        since_ms: Option<i64>,
-        /// 只要服务器时间不晚于它的（毫秒，含）。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        until_ms: Option<i64>,
-    },
-    /// 会话活动：自己所在的会话里 `since_ms` 起有消息的，每个会话给最早、最新一条的服务器时间（不碰内容）。
-    Activity {
-        /// 从这个时间起（毫秒，含）。
-        since_ms: i64,
-    },
     /// 补拉日志序号大于 `since` 的事件。
     Sync {
         /// 上次处理到的序号。
@@ -465,30 +421,27 @@ pub enum Request {
         /// 最多几条。
         limit: u32,
     },
-    /// 新建一个文件（之后按段 `PUT /v1/files/{编号}`）。
-    FileCreate {
-        /// 文件属于哪个会话。
+    /// 把一帧转交给一台在线设备：只在内存里过一下，不写库、不写盘，不在线就回 `online: false`。
+    Relay {
+        /// 哪台设备。
+        to: DeviceId,
+        /// 对方不是自己账号时必须给：双方都要是这个会话现在的成员。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conv: Option<ConvId>,
+        /// 端到端加密的帧，服务器解不开。
+        frame: SealedFrame,
+    },
+    /// 现在在线、能和我对账的设备（自己账号的，和我共享会话的人的）。
+    Peers,
+    /// 发消息之前问一声：这个会话要不要先换代。不带任何内容，服务器也不记。
+    BeforeSend {
+        /// 会话。
         conv: ConvId,
-        /// 密文总字节数。
-        size: u64,
+        /// 我要用第几代钥匙加密。
+        generation: u32,
     },
     /// 保活。
     Ping,
-    /// 阅读扩展的精确消息查询；不推进任何阅读位置。
-    ReadingMessages {
-        conv: ConvId,
-        ids: Vec<MsgId>,
-    },
-    /// 分页取各设备最新的加密阅读记录。after 是服务端记录序号。
-    ReadingGet {
-        conv: ConvId,
-        after: u64,
-        limit: u32,
-    },
-    /// 写本设备的下一版加密阅读记录；相同记录幂等，旧版不能覆盖新版。
-    ReadingSet {
-        envelope: ReadingEnvelope,
-    },
 }
 
 /// 账号签名链的一环 + 服务器日志序号。
@@ -507,17 +460,6 @@ pub struct ConvEntry {
     pub log: u64,
     /// 这一环。
     pub link: ConvLink,
-}
-
-/// 一个会话在一段时间里的活动（[`Request::Activity`] 的结果）。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConvActivity {
-    /// 会话。
-    pub conv: ConvId,
-    /// 这段时间里最早一条消息的服务器时间（毫秒）。
-    pub first_ms: i64,
-    /// 最新一条的服务器时间（毫秒）。
-    pub latest_ms: i64,
 }
 
 /// 这台电脑的状态。
@@ -597,35 +539,16 @@ pub struct ConvSummary {
     pub kind: ConvKind,
     /// 签名链最新序号。
     pub chain_seq: u64,
-    /// 最新一条消息的日志序号（没有为 0）。
+    /// 最近一次变化的日志序号（没有为 0）。
     pub last_log: u64,
     /// 我现在是否是成员（离开过的会话也列出，用来看离开前的历史）。
     pub member: bool,
-}
-
-/// 服务器存的一条消息。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredMessage {
-    /// 日志序号。
-    pub log: u64,
-    /// 服务器收到的时间（毫秒）。
-    pub ts_ms: i64,
-    /// 信封（被撤回的消息密文已删，`ct` 为空）。
-    pub env: Envelope,
-    /// 是否已被撤回。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub recalled: bool,
 }
 
 /// 同步事件。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    /// 新消息（含撤回消息本身）。
-    Message {
-        /// 消息。
-        msg: StoredMessage,
-    },
     /// 会话签名链接了一环（含建会话）。
     ConvLink {
         /// 会话。
@@ -668,9 +591,6 @@ pub struct Welcome {
     /// New DMs require the recipient's explicit approval.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub friend_requests: bool,
-    /// 可选扩展：没有该字段的旧服务器不提供阅读方法。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reading: bool,
     /// 账号。
     pub uid: Uid,
     /// 名字（来自 Cindy）。
@@ -702,15 +622,16 @@ pub enum Response {
         next: Option<u64>,
         pending: u32,
     },
-    /// 阅读范围内的确切消息。
-    ReadingMessages { messages: Vec<StoredMessage> },
-    /// 最新阅读记录分页。
-    ReadingPage {
-        records: Vec<StoredReading>,
-        more: bool,
+    /// 转交的结果：对方在线、已经放进它的发送队列（不等于对方处理完了）。
+    Relayed {
+        /// 对方在线吗。
+        online: bool,
     },
-    /// 平台已接受这份阅读记录。
-    ReadingSaved { log: u64 },
+    /// 现在在线、能和我对账的设备。
+    Peers {
+        /// 设备。
+        peers: Vec<PeerInfo>,
+    },
     /// 登录成功。
     Welcome {
         /// 内容。
@@ -815,25 +736,6 @@ pub enum Response {
         /// 会话签名链。
         entries: Vec<ConvEntry>,
     },
-    /// 消息已收下。
-    Sent {
-        /// 日志序号。
-        log: u64,
-        /// 服务器时间（毫秒）。
-        ts_ms: i64,
-    },
-    /// 一页历史（从新到旧）。
-    Messages {
-        /// 消息。
-        items: Vec<StoredMessage>,
-        /// 是否还有更早的。
-        more: bool,
-    },
-    /// 会话活动（按最新一条从新到旧）。
-    Activity {
-        /// 每个会话一项。
-        items: Vec<ConvActivity>,
-    },
     /// 一批同步事件。
     SyncBatch {
         /// 事件（按日志序号递增）。
@@ -843,13 +745,17 @@ pub enum Response {
         /// 是否还有。
         more: bool,
     },
-    /// 文件已建。
-    FileCreated {
-        /// 文件编号。
-        file: FileId,
-    },
     /// 保活回执。
     Pong,
+}
+
+/// 一台在线设备。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerInfo {
+    /// 账号。
+    pub uid: Uid,
+    /// 设备。
+    pub device: DeviceId,
 }
 
 /// 某一代账号钥匙封装给这台电脑的一份。
@@ -905,8 +811,23 @@ pub enum JoinCloseReason {
 pub enum Push {
     /// Only delivered to connections that subscribed via friend-request methods.
     FriendRequestsChanged,
-    /// 只发给主动调用阅读扩展的连接，不进入旧客户端的补拉事件流。
-    ReadingChanged { conv: ConvId },
+    /// 别的设备转交来的一帧（只在内存里过了一下，服务器解不开）。
+    Relayed {
+        /// 会话（别的账号发来时有）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conv: Option<ConvId>,
+        /// 帧。
+        frame: SealedFrame,
+    },
+    /// 一台能和我对账的设备上线或下线了（只在内存里）。
+    Presence {
+        /// 账号。
+        uid: Uid,
+        /// 设备。
+        device: DeviceId,
+        /// 在线吗。
+        online: bool,
+    },
     /// 同步事件。
     Event {
         /// 事件。
@@ -1132,34 +1053,24 @@ mod tests {
     }
 
     #[test]
-    fn lan_send_and_release_requests_round_trip() {
-        let env = Envelope {
-            conv: ConvId::random(),
-            id: MsgId::random(),
-            generation: 1,
-            sender: Uid::random(),
-            sender_eldest: Fixed([0; 32]),
-            device: DeviceId::random(),
-            recall: None,
-            ct: Bytes(vec![1, 2, 3]),
-        };
-        let send = ClientFrame {
+    fn relay_requests_and_pushes_round_trip() {
+        use crate::keys::DeviceSecret;
+        let (a, b) = (DeviceSecret::generate(), DeviceSecret::generate());
+        let uid = Uid::random();
+        let frame = SealedFrame::seal(&uid, &a, &b.public(), b"x").unwrap();
+        let relay = ClientFrame {
             id: 8,
-            req: Request::SendLan { env: env.clone() },
-        };
-        let decoded: ClientFrame =
-            serde_json::from_str(&serde_json::to_string(&send).unwrap()).unwrap();
-        assert_eq!(decoded, send);
-        let release = ClientFrame {
-            id: 9,
-            req: Request::ReleaseMessage {
-                conv: env.conv,
-                id: env.id,
-                direct_devices: vec![DeviceId::random()],
+            req: Request::Relay {
+                to: b.id(),
+                conv: Some(ConvId::random()),
+                frame: frame.clone(),
             },
         };
         let decoded: ClientFrame =
-            serde_json::from_str(&serde_json::to_string(&release).unwrap()).unwrap();
-        assert_eq!(decoded, release);
+            serde_json::from_str(&serde_json::to_string(&relay).unwrap()).unwrap();
+        assert_eq!(decoded, relay);
+        let push = Push::Relayed { conv: None, frame };
+        let decoded: Push = serde_json::from_str(&serde_json::to_string(&push).unwrap()).unwrap();
+        assert_eq!(decoded, push);
     }
 }

@@ -1,13 +1,12 @@
 //! 加密的个人资料与头像（契约 friend-im v6：头像用 HHH 自己的；第三阶段 plan-v1 §14.4 的个人资料机制沿用）。
 //!
 //! - **发出**：宿主经 `account/avatar` 交来本机用户的头像（自定义的，或画着名字的默认头像，契约 provider-protocol v35），
-//!   插件在内存里记最新一张。它和上次发出去的（凭据里记摘要）不一样时，往自己在的每个会话上传一份加密头像文件、再发一条
-//!   带 `photo` 的个人资料（`Content::Profile`，只有会话里的人解得开），限速发完记下摘要；新会话先传再发。借来的凭据不发。
-//!   不再写 Cindy 头像地址。
-//! - **收到**：个人资料不显示成消息；按发送人记最新的一份（日志序号大的为准，内存里至多 [`PROFILES_MAX`] 人），推
-//!   `people` 事件告诉宿主这个人的头像键；之后人名、成员、私聊会话都带上它。
-//! - **头像键**：加密头像文件写成 [`PHOTO_KEY_PREFIX`] 开头的键（文件编号、钥匙、大小、类型），宿主来读时下载解密；
-//!   自己的头像是 [`SELF_KEY_PREFIX`] 开头的键，直接给内存里宿主交来的那张。旧版好友发的 https 地址仍按地址取（过渡）：
+//!   插件在内存里记最新一张。个人资料不进对账集合：它连同头像字节直接交给在线的会话成员，每次和一台设备对账时也交一份，
+//!   所以离线的人回来后照样拿到最新的。借来的凭据不发。不再写 Cindy 头像地址。
+//! - **收到**：个人资料不显示成消息；按发送人记最新的一份（发送时间大的为准，内存里至多 [`PROFILES_MAX`] 人），推
+//!   `people` 事件告诉宿主这个人的头像键；之后人名、成员、私聊会话都带上它。头像字节留在内存缓存里。
+//! - **头像键**：头像文件写成 [`PHOTO_KEY_PREFIX`] 开头的键（文件编号、随机值、大小、类型）；自己的头像是 [`SELF_KEY_PREFIX`]
+//!   开头的键，直接给内存里宿主交来的那张。旧版好友发的 https 地址仍按地址取（过渡）：
 //!   只取 https、主机在允许的名单里、至多 [`AVATAR_MAX_BYTES`]、只收 PNG / JPEG / WebP / GIF。名单：Cindy 两个区域的域名
 //!   （[`CINDY_AVATAR_DOMAINS`]，含子域名、只走默认端口），再加上自己旧头像地址的主机；好友不能借个人资料让插件去连任意网站。
 //!   取过的都在内存里留最近 [`AVATAR_CACHE_MAX`] 张、合计不超过 [`AVATAR_CACHE_MAX_BYTES`]。
@@ -18,11 +17,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL};
-use friend_im_client::ClientError;
 use friend_im_client::core::bytes::Fixed;
 use friend_im_client::core::file::FileRef;
-use friend_im_client::core::ids::{ConvId, FileId, MsgId, Uid};
-use friend_im_client::core::message::{Content, PHOTO_MAX};
+use friend_im_client::core::ids::{FileId, Uid};
+use friend_im_client::core::message::PHOTO_MAX;
 use hhh_im_protocol::method::{AccountAvatarParams, AvatarsReadParams, ResourceChunk};
 use hhh_im_protocol::rpc::{ErrorKind, RpcError};
 use serde_json::Value;
@@ -30,7 +28,6 @@ use sha2::{Digest as _, Sha256};
 
 use super::session::Live;
 use super::{Server, errors};
-use crate::credential::Announced;
 
 /// 加密头像文件的头像键前缀：`fim-photo:v1:<文件编号>.<钥匙>.<字节数>.<p|j>`（约 90 字节，不超过协议的编号上限）。
 pub(crate) const PHOTO_KEY_PREFIX: &str = "fim-photo:v1:";
@@ -79,7 +76,17 @@ pub(crate) fn parse_photo_key(key: &str) -> Option<FileRef> {
         size,
         name: name.to_owned(),
         mime: mime.to_owned(),
+        sha256: None,
     })
+}
+
+/// 收到的头像字节和个人资料里写的对得上：大小、摘要都一样，确实是图片。
+pub(crate) fn photo_fits(file: &FileRef, bytes: &[u8]) -> bool {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    bytes.len() as u64 == file.size
+        && bytes.len() as u64 <= PHOTO_MAX
+        && file.sha256.is_some_and(|expected| expected.0 == digest)
+        && image_mime(bytes).is_some()
 }
 
 /// 一份个人资料的头像键：新版的加密头像文件优先，旧版的 https 地址其次。
@@ -97,8 +104,6 @@ pub(crate) const AVATAR_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const AVATAR_CACHE_MAX: usize = 64;
 /// 内存里留的头像合计至多多少字节（张数没到也按它丢最旧的）。
 pub(crate) const AVATAR_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
-/// 发个人资料的间隔（服务器每秒至多 5 条，留一条给用户自己发消息）。
-pub(crate) const ANNOUNCE_GAP: Duration = Duration::from_millis(250);
 /// 取一张头像至多等多久。
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// 读头像一段至多多少（协议上限）。
@@ -159,14 +164,14 @@ pub(crate) fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// 收到的个人资料：账号 → （日志序号，头像键）。
+/// 收到的个人资料：账号 → （发送时间，头像键）。
 #[derive(Default)]
 pub(crate) struct Profiles {
     seen: Mutex<HashMap<Uid, (u64, Option<String>)>>,
 }
 
 impl Profiles {
-    /// 记下一份个人资料（头像键见 [`profile_key`]）；比已记的新（日志序号大）才算数。返回这个人的头像是不是变了
+    /// 记下一份个人资料（头像键见 [`profile_key`]）；比已记的新（发送时间大）才算数。返回这个人的头像是不是变了
     /// （变了要告诉宿主）。
     pub(crate) fn note(&self, uid: &Uid, log: u64, key: Option<String>) -> bool {
         let mut seen = self.seen.lock().expect("个人资料锁中毒");
@@ -180,7 +185,7 @@ impl Profiles {
             }
         }
         if seen.len() >= PROFILES_MAX && !seen.contains_key(uid) {
-            // 满了：丢掉最旧的那份（日志序号最小的），按需再从翻到的历史里认识。
+            // 满了：丢掉最旧的那份，下次对账时再认识。
             if let Some(oldest) = seen.iter().min_by_key(|(_, (log, _))| *log).map(|(uid, _)| uid.clone()) {
                 seen.remove(&oldest);
             }
@@ -329,7 +334,7 @@ pub(crate) fn host_photo(params: AccountAvatarParams) -> Result<Option<HostPhoto
 
 impl Server {
     /// `account/avatar`（契约 provider-protocol v35）：记下宿主交来的本机用户头像，告诉宿主“我的头像换了”，在线时在后台
-    /// 往各会话发（不让宿主等上传）。
+    /// 交给各会话的在线成员。
     pub(crate) async fn account_avatar(self: &std::sync::Arc<Self>, params: AccountAvatarParams) -> Result<Value, RpcError> {
         let photo = host_photo(params)?;
         tracing::info!(
@@ -347,20 +352,9 @@ impl Server {
         Ok(serde_json::json!({}))
     }
 
-    /// 宿主交来的头像和上次发出去的不一样，就往自己在的每个会话传一份加密头像、发一条带它的个人资料，发完记下摘要并存
-    /// 凭据（契约 friend-im v6 H1、H2）。借来的凭据不发；还没收到头像不发；没连上、发不出去就停下，下次上线或换头像再发。
-    /// 一次只发一轮（[`Server::announcing`]）：同时来的第二轮等第一轮记下摘要后再比，同一张不再发第二遍。
+    /// 把头像交给各会话的在线成员。借来的凭据不发；还没收到头像不发；不在线的人下次对账时拿到。
     pub(crate) async fn announce_photo(&self, live: &Live) {
-        if live.read_only {
-            tracing::info!("凭据是借来的，不往会话里发个人资料");
-            return;
-        }
-        let _turn = self.announcing.lock().await;
-        let Some(photo) = self.photo.lock().expect("头像锁中毒").clone() else {
-            return;
-        };
-        let announced = live.credential.lock().expect("凭据锁中毒").announced.clone();
-        if announced.as_ref().and_then(|a| a.photo.as_deref()) == Some(photo.sha256.as_str()) {
+        if live.read_only || self.photo.lock().expect("头像锁中毒").is_none() {
             return;
         }
         let convs = match live.client.convs().await {
@@ -370,56 +364,12 @@ impl Server {
                 return;
             }
         };
-        let targets: Vec<ConvId> = convs.into_iter().filter(|c| c.member).map(|c| c.conv).collect();
-        tracing::info!(count = targets.len(), size = photo.bytes.len(), "往会话里发带头像的个人资料");
-        for conv in &targets {
-            if let Err(error) = self.send_photo(live, conv, &photo).await {
-                if matches!(error, ClientError::Disconnected | ClientError::Timeout) {
-                    tracing::info!(%error, "发个人资料时断开了，下次再发");
-                    return;
-                }
-                tracing::info!(%conv, %error, "这个会话发不了个人资料，跳过");
-            }
-            tokio::time::sleep(ANNOUNCE_GAP).await;
-        }
-        let credential = {
-            let mut current = live.credential.lock().expect("凭据锁中毒");
-            current.announced = Some(Announced { avatar: None, photo: Some(photo.sha256.clone()) });
-            current.clone()
-        };
-        if self.save_credential(&credential).await.is_err() {
-            tracing::warn!("记“个人资料发过了”没存下，下次上线会再发一遍");
+        for summary in convs.into_iter().filter(|summary| summary.member) {
+            live.devices.announce(summary.conv);
         }
     }
 
-    /// 刚进的会话（建群、加好友、被拉进群、凭链接进群）：有头像就传一份、发一条个人资料，会话里的人才看得到头像（H3）。
-    pub(crate) async fn announce_to(&self, live: &Live, conv: &ConvId) {
-        if live.read_only {
-            return;
-        }
-        let Some(photo) = self.photo.lock().expect("头像锁中毒").clone() else {
-            return;
-        };
-        if let Err(error) = self.send_photo(live, conv, &photo).await {
-            tracing::info!(%conv, %error, "新会话里发个人资料没成，换头像或下次发时再补");
-        }
-    }
-
-    /// 往一个会话传一份加密头像、再发一条带它的个人资料（和用户自己发的消息排队，一条发完再发下一条）。
-    async fn send_photo(&self, live: &Live, conv: &ConvId, photo: &HostPhoto) -> Result<(), ClientError> {
-        let name = if photo.mime == "image/jpeg" { "avatar.jpg" } else { "avatar.png" };
-        let file = live
-            .client
-            .upload(conv, std::io::Cursor::new(photo.bytes.as_slice()), photo.bytes.len() as u64, name, &photo.mime)
-            .await?;
-        let _turn = self.sends.gate.lock().await;
-        live.client
-            .send(conv, &MsgId::random(), Content::Profile { avatar: None, photo: Some(file) })
-            .await
-            .map(|_| ())
-    }
-
-    /// 一张头像的全部字节：自己的直接给内存里那张；加密头像文件下载解密；旧版的 https 地址按允许名单取。
+    /// 一张头像的全部字节：自己的直接给内存里那张；别人的在收到个人资料时存进了缓存；旧版的 https 地址按允许名单取。
     async fn avatar_bytes(&self, key: &str) -> Result<std::sync::Arc<Vec<u8>>, String> {
         if key.starts_with(SELF_KEY_PREFIX) {
             return self.photo.lock().expect("头像锁中毒").as_ref().map(|photo| photo.bytes.clone()).ok_or_else(|| {
@@ -427,25 +377,13 @@ impl Server {
                 "还没有头像。".to_owned()
             });
         }
-        let Some(file) = parse_photo_key(key) else {
+        if parse_photo_key(key).is_none() {
             return self.avatars.get(key).await;
-        };
-        if let Some(found) = self.avatars.cached(key) {
-            return Ok(found);
         }
-        let live = self.live().await.map_err(|_| "没连上，读不了头像。".to_owned())?;
-        let mut bytes = Vec::with_capacity(file.size as usize);
-        live.client.download(&file, &mut bytes).await.map_err(|error| {
-            tracing::info!(%error, "加密头像下载不下来");
+        self.avatars.cached(key).ok_or_else(|| {
+            tracing::debug!("这张头像还没从对方那里收到");
             "头像取不到。".to_owned()
-        })?;
-        if image_mime(&bytes).is_none() {
-            tracing::info!("解开的头像不是认得的图片");
-            return Err("头像不是图片。".into());
-        }
-        let bytes = std::sync::Arc::new(bytes);
-        self.avatars.remember(key, bytes.clone());
-        Ok(bytes)
+        })
     }
 
     /// `avatars/read`：按头像键读一段。不让取、取不到时回“没有”。
@@ -509,7 +447,7 @@ mod tests {
 
     fn photo(mime: &str, size: u64) -> FileRef {
         let name = if mime == "image/jpeg" { "avatar.jpg" } else { "avatar.png" };
-        FileRef { id: FileId::from_raw([3; 16]), key: Fixed([4; 32]), size, name: name.into(), mime: mime.into() }
+        FileRef { id: FileId::from_raw([3; 16]), key: Fixed([4; 32]), size, name: name.into(), mime: mime.into(), sha256: None }
     }
 
     // 加密头像文件写成头像键再读回来不走样；写法不对、太大、类型不认的都读不出来。
