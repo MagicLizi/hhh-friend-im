@@ -16,4 +16,4 @@ Windows 双桌面夹具加 `--desktop-host <HHH源码目录>`，生成并构建 
 
 ## 设备同步的桌面验收
 
-同一个测试后端加 `--device-sync <配置> <就绪文件>` 是 friend-im v10 的三台桌面验收：alice 两台、bob 一台，第四台新电脑由测试说 `a3` 才加入。每台桌面连自己的转发端口，测试靠它断网；`FRIEND_IM_NO_LAN=1` 让同一台电脑上的实例不走局域网直连。入口是 HHH 的 `hhh-friend/frontend/tests/browser/im-device-sync-desktop.mjs`，不用真实账号、线上服务或真实联系人。
+同一个测试后端加 `--device-sync <配置> <就绪文件>` 是 friend-im v10 的三台桌面验收：alice 两台、bob 一台，第四台新电脑由测试说 `a3-start` 才申请加入，在 alice 的桌面上批准，`a3-finish` 把凭据交给它。每台桌面连自己的转发端口，测试靠它断网；`FRIEND_IM_NO_LAN=1` 让同一台电脑上的实例不走局域网直连。入口是 HHH 的 `hhh-friend/frontend/tests/browser/im-device-sync-desktop.mjs`，不用真实账号、线上服务或真实联系人。

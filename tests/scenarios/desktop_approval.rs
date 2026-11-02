@@ -63,7 +63,8 @@ async fn join(env: &Env, member: &str, name: &str, key: &RecoveryKey, target: &s
 }
 
 /// 设备同步的桌面验收（契约 friend-im v10）：真服务器 + 假 Cindy + 测试账号，alice 两台、bob 一台，
-/// 第四台 alice 的新电脑等测试说 `a3` 才加入。测试账号开通用的设备准备完就下线，消息只在桌面之间走。
+/// 第四台 alice 的新电脑等测试说 `a3-start` 才申请加入，由桌面上批准，批准后 `a3-finish` 把凭据交给那台桌面。
+/// 测试账号开通用的设备准备完就下线，消息只在桌面之间走。
 async fn device_sync(config: &Path, ready: &Path) {
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
@@ -99,6 +100,7 @@ async fn device_sync(config: &Path, ready: &Path) {
     )
     .unwrap();
     let mut completed = String::new();
+    let mut joining = None;
     for _ in 0..36000 {
         if ready.with_extension("stop").exists() {
             break;
@@ -106,8 +108,24 @@ async fn device_sync(config: &Path, ready: &Path) {
         if let Ok(command) = std::fs::read_to_string(ready.with_extension("command"))
             && command != completed
         {
-            if command.starts_with("a3") {
-                join(&env, "alice", "Alice 新电脑", &alice_key, &config["a3"]).await;
+            if command == "a3-start" {
+                let device = env.device("alice", "Alice 新电脑").await;
+                let started = device.client.join_start().await.unwrap();
+                std::fs::write(ready.with_extension("words"), started.code.as_str()).unwrap();
+                joining = Some(device);
+            } else if command == "a3-finish" {
+                let mut device = joining.take().expect("先 a3-start");
+                device
+                    .wait("批准", |u| matches!(u, Update::Activated).then_some(()))
+                    .await;
+                let target = &config["a3"];
+                prepare(
+                    Path::new(target["home"].as_str().unwrap()),
+                    &device.client,
+                    &format!("http://127.0.0.1:{}", target["port"]),
+                )
+                .await;
+                device.client.close();
             }
             std::fs::write(ready.with_extension("ack"), &command).unwrap();
             completed = command;
