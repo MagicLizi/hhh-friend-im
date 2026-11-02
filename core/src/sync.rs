@@ -271,6 +271,24 @@ impl Index {
         changed
     }
 
+    /// 不按合并规则、直接换掉一个元素（可以换排序键）：只给“先记成墓碑的撤回后来证明是伪造的、换回原文”用。
+    pub fn replace(&mut self, item: Item) {
+        match self.by_id.get(&item.key.id) {
+            Some(&i) => self.items[i] = item,
+            None => self.items.push(item),
+        }
+        self.items.sort_by(|a, b| a.key.cmp(&b.key));
+        self.rebuild();
+    }
+
+    /// 去掉一个元素（宿主那边已经没有了时用）。
+    pub fn remove(&mut self, id: &MsgId) {
+        if let Some(&i) = self.by_id.get(id) {
+            self.items.remove(i);
+            self.rebuild();
+        }
+    }
+
     /// `[lower, upper)` 里第一个和最后一个之后的下标。
     fn span(&self, lower: Option<&Key>, upper: &Upper) -> (usize, usize) {
         let start = match lower {

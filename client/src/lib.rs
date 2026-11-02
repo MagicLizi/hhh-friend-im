@@ -46,6 +46,7 @@ mod ops_account;
 mod ops_conv;
 mod reading;
 mod state;
+pub mod sync;
 mod types;
 #[cfg(target_os = "wasi")]
 mod wasi_net;
