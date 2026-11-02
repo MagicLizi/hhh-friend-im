@@ -29,20 +29,6 @@ pub struct Credential {
     /// （契约 friend-im v6），只留着认旧好友头像所在的主机。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<String>,
-    /// 上次往会话里发出去的个人资料（plan-v1 §14.4）；和宿主交来的头像不一样时再发一遍。从没发过为空。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub announced: Option<Announced>,
-}
-
-/// 发出去过的个人资料。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Announced {
-    /// 旧版发的头像地址（没有为空）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub avatar: Option<String>,
-    /// 发出去的 HHH 头像的摘要（契约 friend-im v6；没有为空）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub photo: Option<String>,
 }
 
 impl Credential {
@@ -55,7 +41,6 @@ impl Credential {
             device_name: device_name.to_owned(),
             device,
             avatar: None,
-            announced: None,
         }
     }
 
@@ -128,23 +113,17 @@ mod tests {
         assert!(!format!("{credential:?}").contains(&text[text.len() - 20..]), "Debug 不带私钥");
     }
 
-    // 头像与“发过的个人资料”是可选字段——不带时与第二阶段的凭据一字不差；旧版存的（只有头像地址）照样读回；
-    // 新版记的 HHH 头像摘要（契约 friend-im v6）照样读回。
+    // 头像地址是可选字段——不带时与第二阶段的凭据一字不差；旧版存的（带“发过的个人资料”）照样读回。
     #[test]
-    fn the_avatar_fields_are_optional_and_old_credentials_still_read() {
+    fn the_avatar_field_is_optional_and_old_credentials_still_read() {
         let plain = Credential::new("https://im.example.com", "u", "台式机", Credentials::generate());
         let text = plain.encode();
-        assert!(!text.contains("avatar") && !text.contains("announced"), "{text}");
-        let mut old = plain.clone().with_avatar(Some("https://cdn.example.com/a.png"));
-        old.announced = Some(Announced { avatar: old.avatar.clone(), photo: None });
+        assert!(!text.contains("avatar"), "{text}");
+        let old = plain.clone().with_avatar(Some("https://cdn.example.com/a.png"));
         let mut json: serde_json::Value = serde_json::from_str(&old.encode()).unwrap();
-        assert!(json["announced"].get("photo").is_none(), "没发过 HHH 头像时不写 photo");
         json["announced"] = serde_json::json!({ "avatar": "https://cdn.example.com/a.png" });
         let back = Credential::decode(&json.to_string()).unwrap();
-        assert_eq!(back.announced, old.announced, "旧版存的读得回");
-        let mut new = plain.clone();
-        new.announced = Some(Announced { avatar: None, photo: Some("ab".repeat(32)) });
-        assert_eq!(Credential::decode(&new.encode()).unwrap().announced, new.announced);
+        assert_eq!(back.avatar, old.avatar, "旧版存的读得回");
         assert!(plain.with_avatar(Some("http://insecure/a.png")).avatar.is_none(), "只收 https");
     }
 }

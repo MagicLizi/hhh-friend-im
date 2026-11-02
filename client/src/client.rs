@@ -418,9 +418,9 @@ impl Client {
     }
 
     /// 封一条消息，返回它的原件。`at` 是排序时间（[`friend_im_core::sync::next_at`]）。同一次发送重试时用同一个 `id`。
-    pub async fn seal(&self, conv: &ConvId, id: &MsgId, content: Content, at: i64) -> Result<String> {
-        let env = self.call_any(async |s, c| s.seal(c, conv, id, content, at).await).await?;
-        crate::peers::record_of(&env)
+    pub async fn seal(&self, conv: &ConvId, id: &MsgId, content: Content, at: i64) -> Result<(String, i64)> {
+        let (env, at) = self.call_any(async |s, c| s.seal(c, conv, id, content, at).await).await?;
+        Ok((crate::peers::record_of(&env)?, at))
     }
 
     /// 解开并核对一封信封。

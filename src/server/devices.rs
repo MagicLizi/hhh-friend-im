@@ -417,7 +417,7 @@ impl Profiles {
                 let content = Content::Profile { avatar: None, photo: Some(photo_ref(&photo)) };
                 let at = live.client.now_ms().await;
                 match live.client.seal(conv, &MsgId::random(), content, at).await {
-                    Ok(raw) => {
+                    Ok((raw, _)) => {
                         self.sealed.insert(conv.clone(), (photo.sha256.clone(), raw.clone()));
                         raw
                     }
@@ -503,7 +503,7 @@ async fn meet_everyone(engine: &mut Sync, server: &Server, live: &Live, profiles
 async fn on_send(engine: &mut Sync, live: &Live, conv: &ConvId, id: &MsgId, content: Content) -> Result<i64, ClientError> {
     let seen = engine.seen_max(conv).await.map_err(stored)?;
     let at = next_at(live.client.now_ms().await, seen);
-    let raw = live.client.seal(conv, id, content, at).await?;
+    let (raw, at) = live.client.seal(conv, id, content, at).await?;
     let Applied { rejected, .. } = engine.local(conv, raw).await.map_err(stored)?;
     if rejected > 0 {
         return Err(ClientError::state("这条消息没有通过本机核对"));
@@ -516,7 +516,7 @@ async fn on_recall(engine: &mut Sync, live: &Live, conv: &ConvId, target: &MsgId
     let seen = engine.seen_max(conv).await.map_err(stored)?;
     let at = next_at(live.client.now_ms().await, seen);
     let content = Content::Recall { target: target.clone(), target_at };
-    let raw = live.client.seal(conv, &MsgId::random(), content, at).await?;
+    let (raw, _) = live.client.seal(conv, &MsgId::random(), content, at).await?;
     let applied = engine.local(conv, raw).await.map_err(stored)?;
     if applied.rejected > 0 {
         return Err(ClientError::state("只能撤回自己的消息"));
@@ -626,6 +626,7 @@ async fn handle(engine: &mut Sync, server: &Arc<Server>, live: &Arc<Live>, profi
                         if let Err(error) = engine.sync_with(&peer.device, &conv).await {
                             tracing::info!(%conv, %error, "新成员的对账没开始");
                         }
+                        share_extras(server, live, profiles, &peer.device, &conv).await;
                     }
                 }
             }

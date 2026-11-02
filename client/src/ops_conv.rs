@@ -768,11 +768,12 @@ impl State {
 
     /// 封一条消息（契约 S14）：`at` 是排序时间，由调用方按本会话见过的最大时间算。会话要先换代时先换代。
     /// 用到的签名链和钥匙优先用手里的：断网时照样能封，等对账送达；手里没有才向服务器取。
-    pub async fn seal(&mut self, conn: &Conn, conv: &ConvId, id: &MsgId, content: Content, at: i64) -> Result<Envelope> {
+    /// 这次要先换代时，时间往后挪到换代之后，所以返回实际写进信封的时间。
+    pub async fn seal(&mut self, conn: &Conn, conv: &ConvId, id: &MsgId, content: Content, at: i64) -> Result<(Envelope, i64)> {
         self.require_active()?;
         self.ensure_account_keys(conn).await?;
         let me = self.my_ref(conn).await?;
-        let body = MessageBody {
+        let mut body = MessageBody {
             v: MESSAGE_VERSION,
             ctime_ms: at,
             content,
@@ -781,7 +782,7 @@ impl State {
         for _ in 0..RETRIES {
             let record = self.book.conv(conn, conv).await?;
             if record.state.rotation_pending {
-                self.rotate(conn, conv, Vec::new()).await?;
+                self.rotate_for(conn, conv, &mut body).await?;
             }
             let generation = self.book.convs[conv].state.current_key().generation;
             let seed = match self.conv_seed(conn, conv, generation).await {
@@ -789,7 +790,7 @@ impl State {
                 // 我重置过账号（契约 S7）：私聊的钥匙封装给的是旧身份，拿不到。以新身份接上这个私聊（换一代、封装给现在的
                 // 两个人，对方看到“X 重置了账号”），再用新一代发。
                 Err(error) if self.reset_in_dm(conv, &me) => {
-                    self.rotate(conn, conv, Vec::new()).await?;
+                    self.rotate_for(conn, conv, &mut body).await?;
                     last = Some(error);
                     continue;
                 }
@@ -812,7 +813,7 @@ impl State {
                 Ok(_) | Err(ClientError::Disconnected | ClientError::Timeout) => {}
                 Err(error) => match error.code() {
                     Some(ErrorCode::RotationRequired) => {
-                        self.rotate(conn, conv, Vec::new()).await?;
+                        self.rotate_for(conn, conv, &mut body).await?;
                         last = Some(error);
                         continue;
                     }
@@ -830,8 +831,18 @@ impl State {
                 eldest: me.eldest,
                 device: &self.creds.device,
             };
-            return Ok(Envelope::seal(conv, id.clone(), generation, &seed, &sender, &body)?);
+            return Ok((Envelope::seal(conv, id.clone(), generation, &seed, &sender, &body)?, body.ctime_ms));
         }
         Err(last.unwrap_or(ClientError::Timeout))
+    }
+
+    /// 发这一条之前换代：这条要排在换代写下的系统提示后面（契约 S16：“X 重置了账号”在新钥匙的第一条之前）。
+    async fn rotate_for(&mut self, conn: &Conn, conv: &ConvId, body: &mut MessageBody) -> Result<()> {
+        self.rotate(conn, conv, Vec::new()).await?;
+        let changed = self.book.convs[conv].links.last().and_then(|(link, _)| link.parse().ok()).map(|link| link.ctime_ms);
+        if let Some(changed) = changed {
+            body.ctime_ms = body.ctime_ms.max(changed.saturating_add(1));
+        }
+        Ok(())
     }
 }

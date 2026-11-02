@@ -25,7 +25,7 @@
 //! # let friend_link = link.clone();
 //! let dm = client.add_friend(&friend_link).await?;
 //! let text = Content::Post { parts: vec![Part::Text { text: "你好".into() }], reply_to: None };
-//! let raw = client.seal(&dm, &MsgId::random(), text, 1_700_000_000_000).await?; // 交给对账引擎写进宿主、投给在线设备
+//! let (raw, _at) = client.seal(&dm, &MsgId::random(), text, 1_700_000_000_000).await?; // 交给对账引擎写进宿主、投给在线设备
 //! # let _ = raw;
 //! while let Some(update) = updates.recv().await {
 //!     if let Update::Frame { from, .. } = update {

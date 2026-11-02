@@ -157,10 +157,7 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
             }
             Update::Position(log) => outbox.position(log),
             Update::Conv(notice) => {
-                // 成员变了：刚进的会话发一条个人资料；新成员和在线的成员对一遍账，拿到全部旧消息。
-                if joined(&live.me, &notice) {
-                    live.devices.announce(notice.conv.clone());
-                }
+                // 成员变了：和在线的成员对一遍账（新成员拿到全部旧消息），互相交个人资料。
                 if matches!(notice.change, ConvNotice::Created { .. } | ConvNotice::Added { .. } | ConvNotice::JoinedByInvite) {
                     live.devices.changed(notice.conv.clone());
                 }
@@ -303,15 +300,6 @@ fn left(me: &Uid, notice: &Notice) -> bool {
     match &notice.change {
         ConvNotice::Left => notice.author == *me,
         ConvNotice::Removed { uid, .. } => uid == me,
-        _ => false,
-    }
-}
-
-/// 这条提示是不是“我进了这个会话”（建会话时在成员里、被邀请、凭链接加入）。
-fn joined(me: &Uid, notice: &Notice) -> bool {
-    match &notice.change {
-        ConvNotice::Created { members, .. } | ConvNotice::Added { members } => members.contains(me),
-        ConvNotice::JoinedByInvite => notice.author == *me,
         _ => false,
     }
 }
