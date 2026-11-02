@@ -1,6 +1,6 @@
 //! 设备之间同步，接到插件上（契约 friend-im v10，方案 plan-v10 §4–§9）。
 //!
-//! 一个任务独占对账引擎，所有事情排队进来：发消息、撤回在前（[`Devices::urgent`]），收到的帧、在线变化在后，所以补历史时
+//! 一个任务独占对账引擎，所有事情排队进来：发消息、撤回和刚发出来的消息在前（[`Devices::urgent`]），其余收到的帧、在线变化在后，所以补历史时
 //! 收发新消息不受影响。引擎要的“宿主存储”是 [`HostStore`]：读走 `store/*`（provider-protocol v53），写走 `events/push`，
 //! 宿主回了才算写好。插件自己不存聊天记录，进程重启后索引从宿主重建。
 //!
@@ -114,7 +114,8 @@ impl Devices {
     }
 
     pub(crate) fn frame(&self, from: DeviceId, frame: PeerFrame) {
-        self.post(Command::Frame { from, frame });
+        let queue = if frame.is_live() { &self.urgent } else { &self.commands };
+        let _ = queue.send(Command::Frame { from, frame });
     }
 
     /// 会话的成员变了：和新成员对一遍。

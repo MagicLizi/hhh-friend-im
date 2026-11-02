@@ -145,6 +145,14 @@ pub enum Write {
     },
 }
 
+impl PeerFrame {
+    /// 刚发出来的一条消息（[`Engine::local`] 投的就是一条一帧）。补历史是成批的，这一帧要插到它们前面：
+    /// 新设备补历史的时候，新消息照常到。
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Have { records, .. } if records.len() == 1)
+    }
+}
+
 /// 宿主存储（插件经 v53 读、经 `events/push` 写）。
 #[allow(async_fn_in_trait)]
 pub trait Store {
