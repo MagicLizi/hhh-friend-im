@@ -9,8 +9,10 @@
 //! - 回复排在被回复的消息之后。
 //!
 //! 常规跑 1000 个种子；`cargo test --test sync_sim -- --ignored` 跑 10 万个。失败会打印种子，修好后把种子加进 `REGRESSION`。
+//!
+//! 点名的难点场景在文件末尾的 `cases`：每个场景是写死的剧本，种子只决定帧到达的先后，同一个剧本换几百种先后跑。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -83,6 +85,9 @@ struct SimRecord {
     reply_to: Option<MsgId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recall: Option<Key>,
+    /// 把原件撑到真实信封的大小（量字节数时用）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pad: String,
     sig: u64,
 }
 
@@ -187,6 +192,8 @@ type HostDb = Rc<RefCell<BTreeMap<ConvId, BTreeMap<MsgId, Row>>>>;
 struct MemStore {
     db: HostDb,
     writes: Rc<RefCell<usize>>,
+    /// 还能写几条；写完这些再写就是“写到一半进程没了”。为空是不限。
+    budget: Rc<Cell<Option<usize>>>,
 }
 
 impl Store for MemStore {
@@ -217,6 +224,12 @@ impl Store for MemStore {
         let mut db = self.db.borrow_mut();
         let rows = db.entry(conv.clone()).or_default();
         for write in writes {
+            if let Some(left) = self.budget.get() {
+                if left == 0 {
+                    return Err("写到一半进程没了".into());
+                }
+                self.budget.set(Some(left - 1));
+            }
             *self.writes.borrow_mut() += 1;
             match write {
                 // 宿主按编号去重、同一条以最新为准。
@@ -241,6 +254,7 @@ struct Device {
     group: u8,
     skew: i64,
     db: HostDb,
+    budget: Rc<Cell<Option<usize>>>,
     engine: Option<Engine<MemStore, SimAuth>>,
 }
 
@@ -283,60 +297,70 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 impl World {
-    fn new(seed: u64) -> Self {
-        let mut rng = Rng::new(seed);
+    /// 只有设备的世界：`counts[账号]` 是这个账号有几台设备。`skewed` 时一部分设备电脑时间不准。
+    fn empty(mut rng: Rng, counts: &[usize], skewed: bool) -> Self {
         let truth = Rc::new(RefCell::new(Truth::default()));
-        let accounts = 2 + rng.below(3);
-        let writes = Rc::new(RefCell::new(0));
         let mut devices = Vec::new();
-        for account in 0..accounts {
-            for _ in 0..1 + rng.below(3) {
+        for (account, count) in counts.iter().enumerate() {
+            for _ in 0..*count {
                 let id = DeviceId::from_raw(rng.id16());
                 truth.borrow_mut().owner.insert(id.clone(), account);
                 truth.borrow_mut().secret.insert(id.clone(), rng.next());
-                let skew = if rng.chance(25) { (rng.below(7_200_001) as i64) - 3_600_000 } else { 0 };
-                devices.push(Device { id, account, online: true, group: 0, skew, db: Rc::default(), engine: None });
+                let skew = if skewed && rng.chance(25) { (rng.below(7_200_001) as i64) - 3_600_000 } else { 0 };
+                devices.push(Device { id, account, online: true, group: 0, skew, db: Rc::default(), budget: Rc::default(), engine: None });
             }
         }
-        // 会话：一个全员群、一个私聊、可能再有一个部分成员的群。
-        let mut convs = Vec::new();
-        let add_conv = |rng: &mut Rng, members: BTreeSet<usize>, dm: bool, convs: &mut Vec<Conv>| {
-            let id = ConvId::from_raw(rng.id16());
-            truth.borrow_mut().members.insert(id.clone(), members.clone());
-            truth.borrow_mut().ever.insert(id.clone(), members);
-            convs.push(Conv { id, dm });
-        };
-        add_conv(&mut rng, (0..accounts).collect(), false, &mut convs);
-        add_conv(&mut rng, [0, 1].into(), true, &mut convs);
-        if accounts > 2 && rng.chance(70) {
-            let members: BTreeSet<usize> = (0..accounts).filter(|_| rng.chance(60)).collect();
-            if members.len() >= 2 {
-                add_conv(&mut rng, members, false, &mut convs);
-            }
-        }
-        let mut world = Self {
+        Self {
             rng,
             now: 1_700_000_000_000,
             truth,
-            accounts,
+            accounts: counts.len(),
             devices,
-            convs,
+            convs: Vec::new(),
             wire: Vec::new(),
             sent: Vec::new(),
             honest_recalls: Vec::new(),
             forged_recalls: Vec::new(),
-            writes,
+            writes: Rc::new(RefCell::new(0)),
             lossy: true,
-        };
-        for d in 0..world.devices.len() {
-            world.restart(d);
         }
+    }
+
+    fn add_conv(&mut self, members: BTreeSet<usize>, dm: bool) -> ConvId {
+        let id = ConvId::from_raw(self.rng.id16());
+        self.truth.borrow_mut().members.insert(id.clone(), members.clone());
+        self.truth.borrow_mut().ever.insert(id.clone(), members);
+        self.convs.push(Conv { id: id.clone(), dm });
+        id
+    }
+
+    fn start(&mut self) {
+        for d in 0..self.devices.len() {
+            self.restart(d);
+        }
+    }
+
+    fn new(seed: u64) -> Self {
+        let mut rng = Rng::new(seed);
+        let accounts = 2 + rng.below(3);
+        let counts: Vec<usize> = (0..accounts).map(|_| 1 + rng.below(3)).collect();
+        let mut world = Self::empty(rng, &counts, true);
+        // 会话：一个全员群、一个私聊、可能再有一个部分成员的群。
+        world.add_conv((0..accounts).collect(), false);
+        world.add_conv([0, 1].into(), true);
+        if accounts > 2 && world.rng.chance(70) {
+            let members: BTreeSet<usize> = (0..accounts).filter(|_| world.rng.chance(60)).collect();
+            if members.len() >= 2 {
+                world.add_conv(members, false);
+            }
+        }
+        world.start();
         world
     }
 
     fn restart(&mut self, d: usize) {
         let device = &mut self.devices[d];
-        let store = MemStore { db: device.db.clone(), writes: self.writes.clone() };
+        let store = MemStore { db: device.db.clone(), writes: self.writes.clone(), budget: device.budget.clone() };
         let auth = SimAuth { me: device.id.clone(), truth: self.truth.clone() };
         device.engine = Some(Engine::new(store, auth));
         // 重启后重新认识在线的设备。
@@ -392,8 +416,46 @@ impl World {
         }
         let peer = self.devices[from].id.clone();
         let engine = self.devices[to].engine.as_mut().unwrap();
-        block_on(engine.on_frame(&peer, frame)).unwrap();
-        self.flush(to);
+        match block_on(engine.on_frame(&peer, frame)) {
+            Ok(_) => self.flush(to),
+            Err(error) => {
+                assert_eq!(self.devices[to].budget.get(), Some(0), "只有约好的崩溃才写不进宿主：{error}");
+                self.crash(to);
+            }
+        }
+    }
+
+    /// 插件崩了：内存清空、在途的帧都没了，宿主里已经写好的还在。之后重新上线。
+    fn crash(&mut self, d: usize) {
+        self.devices[d].budget.set(None);
+        self.set_online(d, false);
+        self.wire.retain(|(from, to, _)| *from != d && *to != d);
+        self.devices[d].engine = None;
+        self.devices[d].online = true;
+        self.restart(d);
+        self.devices[d].online = false;
+        self.set_online(d, true);
+    }
+
+    /// 上线或下线：两边互相知道。
+    fn set_online(&mut self, d: usize, online: bool) {
+        let n = self.devices.len();
+        if online {
+            self.devices[d].online = true;
+            for o in 0..n {
+                if o != d && self.reachable(d, o) {
+                    self.presence(d, o);
+                    self.presence(o, d);
+                }
+            }
+        } else {
+            let before: Vec<usize> = (0..n).filter(|&o| o != d && self.reachable(d, o)).collect();
+            self.devices[d].online = false;
+            for o in before {
+                self.absence(d, o);
+                self.absence(o, d);
+            }
+        }
     }
 
     fn members(&self, conv: &ConvId) -> BTreeSet<usize> {
@@ -404,18 +466,22 @@ impl World {
         self.devices[d].db.borrow().get(conv).cloned().unwrap_or_default()
     }
 
-    fn post(&mut self, d: usize, conv: ConvId, recall: Option<Key>) {
-        let account = self.devices[d].account;
+    fn post(&mut self, d: usize, conv: ConvId, recall: Option<Key>) -> MsgId {
         let rows = self.rows(d, &conv);
-        let engine = self.devices[d].engine.as_mut().unwrap();
-        let seen = block_on(engine.seen_max(&conv)).unwrap();
-        let at = next_at(self.now + self.devices[d].skew, seen);
         let reply_to = if recall.is_none() && !rows.is_empty() && self.rng.chance(30) {
             rows.keys().nth(self.rng.below(rows.len())).cloned()
         } else {
             None
         };
-        let mut record = SimRecord { conv: conv.clone(), id: MsgId::from_raw(self.rng.id16()), at, account, device: self.devices[d].id.clone(), reply_to, recall, sig: 0 };
+        self.post_exactly(d, conv, recall, reply_to)
+    }
+
+    fn post_exactly(&mut self, d: usize, conv: ConvId, recall: Option<Key>, reply_to: Option<MsgId>) -> MsgId {
+        let account = self.devices[d].account;
+        let engine = self.devices[d].engine.as_mut().unwrap();
+        let seen = block_on(engine.seen_max(&conv)).unwrap();
+        let at = next_at(self.now + self.devices[d].skew, seen);
+        let mut record = SimRecord { conv: conv.clone(), id: MsgId::from_raw(self.rng.id16()), at, account, device: self.devices[d].id.clone(), reply_to, recall, pad: String::new(), sig: 0 };
         record.sig = sign(self.truth.borrow().secret[&record.device], &record);
         let raw = serde_json::to_string(&record).unwrap();
         if record.recall.is_none() {
@@ -425,6 +491,7 @@ impl World {
         let engine = self.devices[d].engine.as_mut().unwrap();
         block_on(engine.local(&conv, raw)).unwrap();
         self.flush(d);
+        record.id
     }
 
     fn step(&mut self) {
@@ -474,21 +541,7 @@ impl World {
             // 上线 / 下线。
             41..=52 => {
                 let d = self.rng.below(n);
-                let before: Vec<usize> = (0..n).filter(|&o| o != d && self.reachable(d, o)).collect();
-                self.devices[d].online = !self.devices[d].online;
-                if self.devices[d].online {
-                    for o in 0..n {
-                        if o != d && self.reachable(d, o) {
-                            self.presence(d, o);
-                            self.presence(o, d);
-                        }
-                    }
-                } else {
-                    for o in before {
-                        self.absence(d, o);
-                        self.absence(o, d);
-                    }
-                }
+                self.set_online(d, !self.devices[d].online);
             }
             // 断网分区或恢复。
             53..=55 => {
@@ -709,4 +762,455 @@ fn a_thousand_random_worlds_converge() {
 #[ignore = "长跑：cargo test --test sync_sim -- --ignored"]
 fn a_hundred_thousand_random_worlds_converge() {
     run_seeds(1..=100_000);
+}
+
+// ---------- 点名的难点场景（契约 friend-im v10 第 2–4 项）----------
+//
+// 这里不用“全部上线再兜底对账”的 `settle`：只靠上线通知和直接投递，和真实插件平时走的路一样。
+mod cases {
+    use super::*;
+
+    /// 每个剧本换这么多种帧到达的先后。
+    const ORDERS: u64 = 300;
+    /// 要先攒上千条的剧本，换这么多种（每种都要几秒）。
+    const LONG_ORDERS: u64 = 8;
+    const HOUR: i64 = 3_600_000;
+
+    /// 一个私聊（账号 0、1）和一个全员群。
+    fn scripted(seed: u64, counts: &[usize]) -> (World, ConvId, ConvId) {
+        let mut world = World::empty(Rng::new(seed), counts, false);
+        world.lossy = false;
+        let dm = world.add_conv([0, 1].into(), true);
+        let group = world.add_conv((0..counts.len()).collect(), false);
+        world.start();
+        world.drain_wire();
+        (world, dm, group)
+    }
+
+    fn each_order(script: impl Fn(u64)) {
+        for seed in 1..=ORDERS {
+            script(seed);
+        }
+    }
+
+    impl World {
+        fn say(&mut self, d: usize, conv: &ConvId) -> MsgId {
+            self.now += 1_000;
+            self.post_exactly(d, conv.clone(), None, None)
+        }
+
+        fn reply(&mut self, d: usize, conv: &ConvId, target: &MsgId) -> MsgId {
+            self.now += 1_000;
+            self.post_exactly(d, conv.clone(), None, Some(target.clone()))
+        }
+
+        fn recall(&mut self, d: usize, conv: &ConvId, target: &MsgId) {
+            self.now += 1_000;
+            let at = self.rows(d, conv)[target].at;
+            self.post_exactly(d, conv.clone(), Some(Key { at, id: target.clone() }), None);
+        }
+
+        fn leave(&mut self, account: usize, conv: &ConvId) {
+            self.truth.borrow_mut().members.get_mut(conv).unwrap().remove(&account);
+        }
+
+        fn join(&mut self, account: usize, conv: &ConvId) {
+            let mut truth = self.truth.borrow_mut();
+            truth.members.get_mut(conv).unwrap().insert(account);
+            truth.ever.get_mut(conv).unwrap().insert(account);
+        }
+
+        /// 成员变了（真实插件收到签名链变化）：这台设备和在线的设备重新对这个会话。
+        fn membership_changed(&mut self, d: usize, conv: &ConvId) {
+            let engine = self.devices[d].engine.as_mut().unwrap();
+            let peers: Vec<DeviceId> = engine.online().cloned().collect();
+            for peer in peers {
+                block_on(self.devices[d].engine.as_mut().unwrap().sync_with(&peer, conv)).unwrap();
+            }
+            self.flush(d);
+        }
+
+        /// 按排序键排好的编号。
+        fn order(&self, d: usize, conv: &ConvId) -> Vec<MsgId> {
+            let rows = self.rows(d, conv);
+            let mut keys: Vec<Key> = rows.iter().map(|(id, row)| Key { at: row.at, id: id.clone() }).collect();
+            keys.sort();
+            keys.into_iter().map(|key| key.id).collect()
+        }
+
+        /// 这几台设备逐条一样（内容、撤回状态、顺序），一共 `count` 条。
+        #[track_caller]
+        fn agree(&self, conv: &ConvId, devices: &[usize], count: usize) {
+            let first = self.rows(devices[0], conv);
+            assert_eq!(first.len(), count, "设备 {} 的条数不对", devices[0]);
+            for &d in &devices[1..] {
+                assert_eq!(self.rows(d, conv), first, "设备 {} 和设备 {} 不一样", devices[0], d);
+                assert_eq!(self.order(d, conv), self.order(devices[0], conv), "设备 {d} 的顺序不一样");
+            }
+        }
+
+        /// 这些帧有没有一帧把这个会话的东西从 `from` 账号的设备带给 `to` 账号的设备。
+        fn carries(&self, conv: &ConvId, from: usize, to: usize) -> bool {
+            self.wire.iter().any(|(a, b, frame)| {
+                self.devices[*a].account == from
+                    && self.devices[*b].account == to
+                    && matches!(frame, PeerFrame::Have { conv: c, .. } if c == conv)
+            })
+        }
+
+        /// 一帧一帧送完，每送一帧都确认没有东西从 `from` 账号流向 `to` 账号。
+        #[track_caller]
+        fn drain_without(&mut self, conv: &ConvId, from: usize, to: usize) {
+            while !self.wire.is_empty() {
+                assert!(!self.carries(conv, from, to), "有东西流向了不该拿的账号");
+                self.deliver_one();
+            }
+        }
+    }
+
+    // 两台同时离线各自发：同一毫秒发的也排得出同一个顺序，不丢不重。
+    #[test]
+    fn two_devices_offline_at_once_each_send_and_then_agree() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[2, 1]);
+            w.set_online(0, false);
+            w.set_online(1, false);
+            for _ in 0..5 {
+                w.post_exactly(0, dm.clone(), None, None);
+                w.post_exactly(1, dm.clone(), None, None);
+                w.say(2, &dm);
+            }
+            assert_eq!(w.rows(2, &dm).len(), 5, "离线的两台还没交上来");
+            w.set_online(0, true);
+            w.set_online(1, true);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1, 2], 15);
+        });
+    }
+
+    // 时间快一小时的电脑：之后看到它的设备发的消息和回复都排在它后面；时间慢一小时的回复也排在原消息后面。
+    #[test]
+    fn a_clock_an_hour_off_keeps_replies_after_the_original() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[2, 1]);
+            w.devices[2].skew = HOUR;
+            w.devices[1].skew = -HOUR;
+            let fast = w.say(2, &dm);
+            w.drain_wire();
+            let answer = w.reply(0, &dm, &fast);
+            w.drain_wire();
+            let late = w.reply(1, &dm, &answer);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1, 2], 3);
+            assert_eq!(w.order(0, &dm), [fast, answer, late], "回复排在原消息之后");
+        });
+    }
+
+    // 时间快一小时的电脑离线时发的：回来以后大家一致，它之后再发也接着往后排。
+    #[test]
+    fn a_fast_clock_offline_for_a_while_still_agrees() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[2, 1]);
+            w.devices[1].skew = HOUR;
+            w.set_online(1, false);
+            let ahead = w.say(1, &dm);
+            let before = w.say(0, &dm);
+            w.say(2, &dm);
+            w.set_online(1, true);
+            w.drain_wire();
+            let after = w.reply(0, &dm, &ahead);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1, 2], 4);
+            let order = w.order(2, &dm);
+            let at = |id: &MsgId| order.iter().position(|x| x == id).unwrap();
+            assert!(at(&before) < at(&ahead) && at(&ahead) < at(&after));
+        });
+    }
+
+    // 撤回比原消息先到：先记墓碑，原消息后到也不复活；重复送一遍原文也不复活。
+    #[test]
+    fn a_recall_arriving_before_the_original_wins() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[1, 1]);
+            let id = w.say(0, &dm);
+            let original = w.wire.last().cloned().unwrap();
+            w.recall(0, &dm, &id);
+            let recall = w.wire.pop().unwrap();
+            w.wire.clear();
+            w.wire.push(recall);
+            w.deliver_one();
+            assert!(w.rows(1, &dm)[&id].tomb, "撤回先到就是墓碑");
+            w.wire.push(original.clone());
+            w.deliver_one();
+            w.wire.push(original);
+            w.deliver_one();
+            w.drain_wire();
+            assert!(w.rows(1, &dm)[&id].tomb, "原消息后到不复活");
+            w.agree(&dm, &[0, 1], 1);
+        });
+    }
+
+    // 长期离线的设备回来：补齐别处发的几百条，别处撤回的、它手里还有原文的那条不复活，它离线时发的也交出去。
+    #[test]
+    fn a_device_back_after_a_long_absence_catches_up_without_reviving_anything() {
+        for seed in 1..=LONG_ORDERS {
+            let (mut w, dm, _) = scripted(seed, &[2, 1]);
+            let old: Vec<MsgId> = (0..10).map(|_| w.say(0, &dm)).collect();
+            w.drain_wire();
+            w.agree(&dm, &[0, 1, 2], 10);
+            w.set_online(1, false);
+            for i in 0..700 {
+                w.say(if i % 3 == 0 { 2 } else { 0 }, &dm);
+                if i % 50 == 0 {
+                    w.drain_wire();
+                }
+            }
+            w.recall(0, &dm, &old[3]);
+            w.recall(2, &dm, &old[3]);
+            w.drain_wire();
+            let mine = w.say(1, &dm);
+            assert!(!w.rows(1, &dm)[&old[3]].tomb, "离线那台手里还是原文");
+            w.set_online(1, true);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1, 2], 711);
+            assert!(w.rows(0, &dm)[&old[3]].tomb && w.rows(1, &dm)[&old[3]].tomb, "撤回不复活");
+            assert!(w.rows(2, &dm).contains_key(&mine), "它离线时发的也交出去了");
+        }
+    }
+
+    // 发完立刻断网：对方这时收不到，发的人也不算丢；重新联网后送到，只有一条。
+    #[test]
+    fn a_message_sent_right_before_the_network_drops_arrives_later() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[1, 1]);
+            let id = w.say(0, &dm);
+            w.set_online(0, false);
+            w.drain_wire();
+            assert!(w.rows(1, &dm).is_empty(), "断在路上了");
+            assert!(w.rows(0, &dm).contains_key(&id), "本机已保存");
+            w.set_online(0, true);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1], 1);
+        });
+    }
+
+    // 对账做到一半插件崩溃：写进宿主的留着，没写的重新补，不丢不重，也不用从头再来。
+    #[test]
+    fn a_crash_halfway_through_catching_up_loses_and_repeats_nothing() {
+        for seed in 1..=LONG_ORDERS {
+            let (mut w, dm, _) = scripted(seed, &[1, 1]);
+            w.set_online(1, false);
+            for _ in 0..1_200 {
+                w.say(0, &dm);
+            }
+            w.drain_wire();
+            let written = *w.writes.borrow();
+            // 写到一批的中间崩掉（一批 500 条）。
+            w.devices[1].budget.set(Some(100 + w.rng.below(900)));
+            w.set_online(1, true);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1], 1_200);
+            assert_eq!(w.devices[1].budget.get(), None, "真的崩过一次");
+            let wrote = *w.writes.borrow() - written;
+            assert!(wrote <= 1_200 + 500, "崩溃后只补没写的，实际写了 {wrote} 条");
+        }
+    }
+
+    // 插件重启时还有帧在路上：对方发来的那一段丢了，重新认识以后补上。
+    #[test]
+    fn a_restart_with_frames_in_flight_loses_nothing() {
+        for seed in 1..=LONG_ORDERS {
+            let (mut w, dm, _) = scripted(seed, &[1, 1]);
+            w.set_online(1, false);
+            for _ in 0..800 {
+                w.say(0, &dm);
+            }
+            w.drain_wire();
+            w.set_online(1, true);
+            for _ in 0..1 + w.rng.below(8) {
+                w.deliver_one();
+            }
+            w.crash(1);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1], 800);
+        }
+    }
+
+    // 两台同时给同一台补：不管怎么交错都不重复，也不会打转。
+    #[test]
+    fn two_devices_filling_in_the_same_device_at_once_agree() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[2, 1]);
+            w.set_online(2, false);
+            let ids: Vec<MsgId> = (0..60).map(|i| w.say(i % 2, &dm)).collect();
+            w.recall(0, &dm, &ids[0]);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1], 60);
+            let before = *w.writes.borrow();
+            w.set_online(2, true);
+            w.drain_wire();
+            w.agree(&dm, &[0, 1, 2], 60);
+            assert!(*w.writes.borrow() - before <= 2 * 60, "两台最多各给一遍");
+        });
+    }
+
+    // 接收方全部离线时发送，然后发送的这台也关了：只开发送方的另一台，接收方上线照样收到。
+    #[test]
+    fn the_senders_other_device_delivers_when_the_sender_is_off() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[2, 1]);
+            w.set_online(2, false);
+            w.say(0, &dm);
+            w.drain_wire();
+            w.set_online(0, false);
+            w.set_online(2, true);
+            w.drain_wire();
+            w.agree(&dm, &[1, 2], 1);
+        });
+    }
+
+    // 发送方全部离线：要等它有设备上线才送到。
+    #[test]
+    fn nothing_arrives_until_a_device_holding_the_message_is_online() {
+        each_order(|seed| {
+            let (mut w, dm, _) = scripted(seed, &[2, 1]);
+            w.set_online(1, false);
+            w.set_online(2, false);
+            w.say(0, &dm);
+            w.set_online(0, false);
+            w.set_online(2, true);
+            w.drain_wire();
+            assert!(w.rows(2, &dm).is_empty());
+            w.set_online(0, true);
+            w.drain_wire();
+            w.agree(&dm, &[0, 2], 1);
+        });
+    }
+
+    // 群里已经收到的成员帮着补：发的人关机了，别的成员上线时从收到过的成员那里拿到。
+    #[test]
+    fn a_group_member_who_got_it_passes_it_on() {
+        each_order(|seed| {
+            let (mut w, _, group) = scripted(seed, &[1, 1, 1]);
+            w.set_online(2, false);
+            w.say(0, &group);
+            w.drain_wire();
+            w.set_online(0, false);
+            w.set_online(2, true);
+            w.drain_wire();
+            w.agree(&group, &[1, 2], 1);
+        });
+    }
+
+    // 退群的人（账号 2）：离开后别人不给他任何东西，他也交不出去；他自己的两台设备之间照样同步离开前的记录。
+    #[test]
+    fn someone_who_left_neither_gets_nor_gives_but_their_own_devices_still_sync() {
+        each_order(|seed| {
+            let (mut w, _, group) = scripted(seed, &[1, 1, 2]);
+            let (alice, bob, leaver, second) = (0, 1, 2, 3);
+            let early = w.say(alice, &group);
+            w.drain_wire();
+            w.agree(&group, &[alice, bob, leaver, second], 1);
+            // 他的第二台设备关着；另外两个人也离线时，他发了一条，只有他自己手里有。
+            w.set_online(second, false);
+            w.set_online(alice, false);
+            w.set_online(bob, false);
+            let unsent = w.say(leaver, &group);
+            w.leave(2, &group);
+            w.set_online(alice, true);
+            w.set_online(bob, true);
+            let after = w.say(alice, &group);
+            w.drain_without(&group, 0, 2);
+            w.set_online(second, true);
+            w.drain_without(&group, 1, 2);
+            // 兜底对账也一样。
+            for d in [alice, bob, leaver, second] {
+                w.membership_changed(d, &group);
+            }
+            w.drain_without(&group, 0, 2);
+            assert!(w.rows(bob, &group).contains_key(&after));
+            assert!(!w.rows(bob, &group).contains_key(&unsent), "离开的人交不出来");
+            assert!(!w.rows(alice, &group).contains_key(&unsent), "离开的人交不出来");
+            for d in [leaver, second] {
+                assert!(!w.rows(d, &group).contains_key(&after), "离开后的拿不到");
+                assert!(w.rows(d, &group).contains_key(&early), "离开前的还在");
+            }
+            w.agree(&group, &[leaver, second], 2);
+        });
+    }
+
+    // 新成员从群里在线的成员那里拿到全部旧消息，和大家一样。
+    #[test]
+    fn a_new_member_gets_the_whole_history_from_a_member() {
+        each_order(|seed| {
+            let mut w = World::empty(Rng::new(seed), &[1, 1, 1], false);
+            w.lossy = false;
+            let group = w.add_conv([0, 1].into(), false);
+            w.start();
+            let first = w.say(0, &group);
+            w.say(1, &group);
+            w.recall(0, &group, &first);
+            w.drain_wire();
+            assert!(w.rows(2, &group).is_empty(), "还不是成员");
+            w.join(2, &group);
+            w.membership_changed(0, &group);
+            w.drain_wire();
+            w.agree(&group, &[0, 1, 2], 2);
+            assert!(w.rows(2, &group)[&first].tomb, "撤回的还是撤回");
+        });
+    }
+
+    // 两边各 1 万条、相差 10 条：3 秒内对完，来回不超过 100 KB（量的是帧的 JSON 按线上的 base64 算，加上每帧的封装开销）。
+    #[test]
+    fn ten_thousand_differing_by_ten_cost_little() {
+        const FRAME_OVERHEAD: usize = 300;
+        // 一条文字消息的真实信封约 700 字节。
+        let pad = "x".repeat(420);
+        let (mut w, dm, _) = scripted(7, &[2, 0]);
+        let record = |w: &mut World, device: usize, at: i64| {
+            let mut record = SimRecord { conv: dm.clone(), id: MsgId::from_raw(w.rng.id16()), at, account: 0, device: w.devices[device].id.clone(), reply_to: None, recall: None, pad: pad.clone(), sig: 0 };
+            record.sig = sign(w.truth.borrow().secret[&record.device], &record);
+            (record.id.clone(), Row { at, tomb: false, raw: serde_json::to_string(&record).unwrap() })
+        };
+        let mut common = BTreeMap::new();
+        for i in 0..10_000 {
+            let (id, row) = record(&mut w, 0, 1_700_000_000_000 + i);
+            common.insert(id, row);
+        }
+        let (left, right) = (w.devices[0].db.clone(), w.devices[1].db.clone());
+        left.borrow_mut().insert(dm.clone(), common.clone());
+        right.borrow_mut().insert(dm.clone(), common);
+        for i in 0..5 {
+            let (id, row) = record(&mut w, 0, 1_700_000_000_000 + i * 1_999);
+            left.borrow_mut().get_mut(&dm).unwrap().insert(id, row);
+            let (id, row) = record(&mut w, 1, 1_700_000_000_000 + i * 1_999 + 1);
+            right.borrow_mut().get_mut(&dm).unwrap().insert(id, row);
+        }
+        w.set_online(1, false);
+        w.start();
+        let started = std::time::Instant::now();
+        w.set_online(1, true);
+        let (mut bytes, mut frames) = (0, 0);
+        let mut guard = 0;
+        while !w.wire.is_empty() {
+            guard += 1;
+            assert!(guard < 1_000, "不收敛");
+            // 按到达顺序量：先取出来算大小，再送。
+            let (from, to, frame) = w.wire.remove(0);
+            bytes += serde_json::to_vec(&frame).unwrap().len() * 4 / 3 + FRAME_OVERHEAD;
+            frames += 1;
+            w.wire.push((from, to, frame));
+            let last = w.wire.len() - 1;
+            w.wire.swap(0, last);
+            let frame = w.wire.remove(0);
+            let peer = w.devices[frame.0].id.clone();
+            block_on(w.devices[frame.1].engine.as_mut().unwrap().on_frame(&peer, frame.2)).unwrap();
+            w.flush(frame.1);
+        }
+        let took = started.elapsed();
+        w.agree(&dm, &[0, 1], 10_010);
+        eprintln!("1 万条差 10 条：{took:?}，{frames} 帧，{bytes} 字节");
+        assert!(bytes <= 100 * 1024, "来回 {bytes} 字节");
+        assert!(took.as_secs() < 3, "用了 {took:?}");
+    }
 }
