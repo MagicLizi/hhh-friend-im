@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn read_positions_sort_like_keys_and_fit_the_protocol() {
         let key = |at, raw| Key { at, id: MsgId::from_raw([raw; 16]) };
-        let mut keys = vec![key(1_700_000_000_000, 0), key(1_700_000_000_000, 255), key(1_700_000_000_000, 7), key(999, 3), key(1_700_000_000_001, 1)];
+        let mut keys = [key(1_700_000_000_000, 0), key(1_700_000_000_000, 255), key(1_700_000_000_000, 7), key(999, 3), key(1_700_000_000_001, 1)];
         keys.sort();
         let positions: Vec<String> = keys.iter().map(read_position).collect();
         for pair in positions.windows(2) {

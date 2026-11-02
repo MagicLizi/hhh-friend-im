@@ -326,6 +326,7 @@ pub(crate) fn conv_rejected(conv: &str, log: u64, at_ms: i64) -> Wire {
 }
 
 /// 要发的一段（附件已经上传好、换成了文件引用）。
+#[allow(clippy::large_enum_variant)] // 只活一次发送。
 pub(crate) enum Piece {
     /// 文字、提及。
     Part(Part),

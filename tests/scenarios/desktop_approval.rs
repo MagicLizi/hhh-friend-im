@@ -2,7 +2,8 @@ use common::*;
 use friend_im::credential::Credential;
 use friend_im_client::{
     Client,
-    core::{conv::GroupProfile, ids::MsgId},
+    Update,
+    core::{conv::GroupProfile, ids::MsgId, keys::RecoveryKey},
 };
 use serde_json::json;
 use std::{
@@ -40,6 +41,81 @@ async fn prepare(home: &Path, client: &Client, server: &str) {
         &json!({"credential":credential,"server":server}).to_string(),
     );
 }
+/// 一台桌面的新设备：用恢复密钥加入，把凭据写进这台桌面的隔离凭据。连的是桌面自己那个转发端口，测试靠它断网。
+async fn join(env: &Env, member: &str, name: &str, key: &RecoveryKey, target: &serde_json::Value) {
+    let mut device = env.device(member, name).await;
+    device
+        .client
+        .join_with_recovery(&key.to_words())
+        .await
+        .unwrap();
+    device
+        .wait("可用", |u| matches!(u, Update::Activated).then_some(()))
+        .await;
+    let server = format!("http://127.0.0.1:{}", target["port"]);
+    prepare(
+        Path::new(target["home"].as_str().unwrap()),
+        &device.client,
+        &server,
+    )
+    .await;
+    device.client.close();
+}
+
+/// 设备同步的桌面验收（契约 friend-im v10）：真服务器 + 假 Cindy + 测试账号，alice 两台、bob 一台，
+/// 第四台 alice 的新电脑等测试说 `a3` 才加入。测试账号开通用的设备准备完就下线，消息只在桌面之间走。
+async fn device_sync(config: &Path, ready: &Path) {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+    let env = Env::start().await;
+    let (alice, alice_key) = env.account("alice", "Alice 开通").await;
+    let (bob, bob_key) = env.account("bob", "Bob 开通").await;
+    let dm = approved_dm(&alice.client, &bob.client).await;
+    let group = alice
+        .client
+        .create_group(
+            &GroupProfile {
+                name: "设备同步验收群".into(),
+                ..Default::default()
+            },
+            &[bob.client.uid().clone()],
+        )
+        .await
+        .unwrap();
+    join(&env, "alice", "Alice 台式机", &alice_key, &config["a1"]).await;
+    join(&env, "alice", "Alice 笔记本", &alice_key, &config["a2"]).await;
+    join(&env, "bob", "Bob 台式机", &bob_key, &config["b"]).await;
+    alice.client.close();
+    bob.client.close();
+    std::fs::write(
+        ready,
+        json!({
+            "server": env.server.url(),
+            "data": env.server.dir.path(),
+            "dm": dm.to_string(),
+            "group": group.to_string(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut completed = String::new();
+    for _ in 0..36000 {
+        if ready.with_extension("stop").exists() {
+            break;
+        }
+        if let Ok(command) = std::fs::read_to_string(ready.with_extension("command"))
+            && command != completed
+        {
+            if command.starts_with("a3") {
+                join(&env, "alice", "Alice 新电脑", &alice_key, &config["a3"]).await;
+            }
+            std::fs::write(ready.with_extension("ack"), &command).unwrap();
+            completed = command;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -62,6 +138,7 @@ async fn main() {
         credential_store::isolate(
             identity["id"].as_str().unwrap(),
             &home.join("credentials.json"),
+            Vec::new(),
         )
         .unwrap();
         credential_store::put(
@@ -75,6 +152,10 @@ async fn main() {
             parameters.to_string(),
         )
         .unwrap();
+        return;
+    }
+    if args[1] == "--device-sync" {
+        device_sync(Path::new(&args[2]), Path::new(&args[3])).await;
         return;
     }
     let ready = Path::new(&args[3]);
@@ -96,16 +177,14 @@ async fn main() {
         .await
         .unwrap();
     alice
-        .client
-        .send(
+        .send_as(
             &group,
             &MsgId::random(),
             text("我是 alice，点击头像查看名片"),
         )
         .await
         .unwrap();
-    bob.client
-        .send(&group, &MsgId::random(), text("我是 bob，点击头像查看名片"))
+    bob.send_as(&group, &MsgId::random(), text("我是 bob，点击头像查看名片"))
         .await
         .unwrap();
     // Each desktop owns a distinct device. Reusing a live fixture device lets LAN

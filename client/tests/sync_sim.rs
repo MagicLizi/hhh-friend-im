@@ -668,9 +668,9 @@ impl World {
         let truth = self.truth.borrow();
         for conv in &self.convs {
             let members = &truth.members[&conv.id];
-            let views: Vec<(usize, BTreeMap<MsgId, (i64, bool)>)> = (0..self.devices.len())
+            let views: Vec<_> = (0..self.devices.len())
                 .filter(|&d| members.contains(&self.devices[d].account))
-                .map(|d| (d, self.rows(d, &conv.id).into_iter().map(|(id, row)| (id, (row.at, row.tomb))).collect()))
+                .map(|d| (d, self.rows(d, &conv.id).into_iter().map(|(id, row)| (id, (row.at, row.tomb))).collect::<BTreeMap<_, _>>()))
                 .collect();
             for pair in views.windows(2) {
                 assert_eq!(pair[0].1, pair[1].1, "种子 {seed}：会话里设备 {} 和 {} 不一致", pair[0].0, pair[1].0);

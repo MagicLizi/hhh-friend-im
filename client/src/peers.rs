@@ -43,6 +43,7 @@ pub(crate) fn record_of(env: &Envelope) -> Result<String> {
 
 /// 解开的一份原件。
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // 只在翻译时用一下，不进集合。
 pub enum Opened {
     /// 一条消息（含撤回消息本身）。
     Message(Message),

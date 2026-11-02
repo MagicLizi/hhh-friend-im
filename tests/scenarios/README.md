@@ -13,3 +13,7 @@ python scripts/test-group-contacts.py --server ../hhh-friend-im-server --server-
 Windows 双桌面夹具加 `--desktop-host <HHH源码目录>`，生成并构建 `approval-desktop` 示例。`desktop_approval.rs` 只创建临时签发方和服务器，给两个桌面分配独立设备，以宿主隔离凭据 API 写入测试凭据；恢复密钥不输出。受控过期与冷却只修改临时数据库，不改系统时钟。退出写入 ready 文件同名 `.stop`。
 
 在 HHH 任务目录用构建工具包裹上面的命令，再执行 `node hhh-friend/frontend/tests/browser/im-friend-approval-desktop.mjs --fixture <approval-desktop.exe> --release <本地签名测试包目录> --public-key <测试公钥>`；`--links` 单独补验好友链接、列表重申与已有好友历史。测试包只能使用任务测试签名，不使用生产私钥。视频、截图和结果写入本任务 evidence，结束关闭两个桌面和临时服务。
+
+## 设备同步的桌面验收
+
+同一个测试后端加 `--device-sync <配置> <就绪文件>` 是 friend-im v10 的三台桌面验收：alice 两台、bob 一台，第四台新电脑由测试说 `a3` 才加入。每台桌面连自己的转发端口，测试靠它断网；`FRIEND_IM_NO_LAN=1` 让同一台电脑上的实例不走局域网直连。入口是 HHH 的 `hhh-friend/frontend/tests/browser/im-device-sync-desktop.mjs`，不用真实账号、线上服务或真实联系人。

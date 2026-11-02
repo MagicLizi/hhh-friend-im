@@ -84,6 +84,13 @@ impl Lan {
                 "WASI 构建不做局域网直连",
             ));
         }
+        // 同一台电脑上的几个测试实例要模拟“互相不通”时用：不发现、不监听，只走服务器转交。
+        if std::env::var_os("FRIEND_IM_NO_LAN").is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "局域网直连被 FRIEND_IM_NO_LAN 关掉了",
+            ));
+        }
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
         let port = listener.local_addr()?.port();
         let public = secret.public();

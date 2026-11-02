@@ -529,8 +529,9 @@ fn stored(error: SyncError) -> ClientError {
 }
 
 /// 收到别的设备要文件：有权才给，宿主里没有就说没有，不替它下载。
+#[allow(clippy::too_many_arguments)]
 async fn serve_file(server: Arc<Server>, live: Arc<Live>, from: DeviceId, req: u64, conv: ConvId, key: String, offset: u64, length: u64) {
-    let length = length.min(FILE_FRAME_BYTES).max(1);
+    let length = length.clamp(1, FILE_FRAME_BYTES);
     let reply = if !live.client.may_share(&conv, &from).await {
         tracing::info!(device = %from, %conv, "对方无权拿这个会话的文件");
         PeerFrame::FileMissing { req }

@@ -435,10 +435,7 @@ impl Client {
 
     /// 这台设备能不能和我交换这个会话。
     pub async fn may_share(&self, conv: &ConvId, peer: &DeviceId) -> bool {
-        match self.call_any(async |s, c| Ok(s.may_share(c, conv, peer).await)).await {
-            Ok(allowed) => allowed,
-            Err(_) => false,
-        }
+        self.call_any(async |s, c| Ok(s.may_share(c, conv, peer).await)).await.unwrap_or_default()
     }
 
     /// 这台设备是不是我自己账号的。
