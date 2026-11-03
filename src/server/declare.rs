@@ -1,8 +1,9 @@
 //! `initialize`（protocol-v1 §4.1、§5）：插件信息、平台说明、能力与设置项。`tests/initialize.rs` 用 hhh-im-check 同一套规则核对。
 //!
-//! - 能重读历史（`history = server`）：服务器按会话存着全部密文，随时能翻；新消息另有实时推送。
-//! - 每条消息能回复；本人发的能撤回，不限时（服务器上的密文随之删除）。不能编辑、不能点表情、没有话题。
-//! - 附件上限与服务器一致：图片、文件都到 100 MiB；文件名按字节算，255 字节以内（服务器按 255 个字收）。
+//! - 历史读法是 `history = none`：服务器不存消息，设备之间对账补齐，收到的都推给宿主。声明 `storeRead`，读回宿主替插件
+//!   保存的原件和文件，再交给别的设备（provider-protocol v53）。
+//! - 每条消息能回复；本人发的能撤回，不限时（所有设备上的原文随之换成墓碑）。不能编辑、不能点表情、没有话题。
+//! - 附件上限：图片、文件都到 100 MiB；文件名按字节算，255 字节以内。
 //! - 设置只有一项：服务器地址，默认填用户自己部署的那台。
 //! - 第三阶段：只有一种登录方式“用 Cindy 账号登录”（`host`，[`super::login`]）；账号级操作五项、群的操作三项
 //!   （[`super::actions`]）；能读头像（头像键是 Cindy 头像地址）、会推“人变了”（收到别人的个人资料）。
@@ -12,9 +13,8 @@ use hhh_im_protocol::method::{
     ActionDecl, ActionScope, InitializeParams, InitializeResult, ProviderInfo,
 };
 use hhh_im_protocol::platform::{
-    AccountCaps, ActionRules, AvatarShape, Capabilities, ConversationCaps, DiscoveryDesc,
-    EventCaps, HistoryMode, Limits, MessageCaps, OwnWithin, PeopleCaps, PlatformDesc, RateBudget,
-    ResourceCaps, SendCaps, SettingDecl,
+    AccountCaps, ActionRules, AvatarShape, Capabilities, ConversationCaps, EventCaps, HistoryMode,
+    Limits, MessageCaps, OwnWithin, PeopleCaps, PlatformDesc, ResourceCaps, SendCaps, SettingDecl,
 };
 use hhh_im_protocol::rpc::{ErrorKind, RpcError};
 use hhh_im_protocol::types::ConversationKind;
@@ -30,11 +30,9 @@ pub(crate) const PROVIDER_NAME: &str = "Cindy IM";
 pub(crate) const SETTING_SERVER: &str = "serverUrl";
 /// 服务器地址的默认值：Cindy IM 的官方服务器（契约 §8：服务器地址是插件的设置项，默认填官方的那台）。
 pub(crate) const DEFAULT_SERVER: &str = "https://hhh-friend-im.magiclizi.com";
-/// 一页最多几条（同服务器的上限）。
-pub(crate) const PAGE_MAX: u32 = limits::HISTORY_PAGE_MAX;
 /// 文件按多大一段读：16 个加密块，正好 1 MiB 明文（协议一段的上限）。
 pub(crate) const FILE_SEGMENT_BYTES: u64 = 1024 * 1024;
-/// 附件名的上限（字节）：服务器按 255 个字收，这里按字节写 255，任何写法都不会超。
+/// 附件名的上限（字节）：消息按 255 个字收，这里按字节写 255，任何写法都不会超。
 const ATTACHMENT_NAME_MAX_BYTES: u32 = 255;
 
 /// 平台说明。
@@ -42,7 +40,7 @@ pub(crate) fn platform() -> PlatformDesc {
     PlatformDesc {
         avatar_shape: AvatarShape::Circle,
         avatar_identity: None,
-        history: HistoryMode::Server,
+        history: HistoryMode::None,
         actions: ActionRules {
             reply: true,
             thread: false,
@@ -56,12 +54,8 @@ pub(crate) fn platform() -> PlatformDesc {
         chat_link: None,
         image_name_prefix: Some(PROVIDER_NAME.into()),
         conversation_nouns: None,
-        page_max: Some(PAGE_MAX),
-        // 服务器不限读取；新电脑补齐 1 万条要翻 100 页（契约 §7：5 分钟内），比宿主默认的每分钟 120 次放宽一些。
-        reads: Some(RateBudget {
-            per_second: 20,
-            per_minute: 600,
-        }),
+        page_max: None,
+        reads: None,
         downloads: None,
         file_segment_bytes: Some(FILE_SEGMENT_BYTES),
         limits: Some(Limits {
@@ -75,12 +69,7 @@ pub(crate) fn platform() -> PlatformDesc {
         reactions_in_reads: false,
         emoji_per_account: false,
         emoji: None,
-        // 会话发现：一次问到底（服务器一次给全，至多 1000 个会话）。
-        discovery: Some(DiscoveryDesc {
-            fastest_secs: 30,
-            pages: 1,
-            cold_pages: 1,
-        }),
+        discovery: None,
         user_adjustable: Vec::new(),
         edits_by_content: Vec::new(),
         retranslate_rules: Vec::new(),
@@ -123,11 +112,11 @@ pub(crate) fn capabilities() -> Capabilities {
             search: false,
             members: true,
             find_direct: false,
-            recent_activity: true,
+            recent_activity: false,
         },
         messages: MessageCaps {
             forwarded: false,
-            list: true,
+            list: false,
             get: false,
         },
         people: PeopleCaps {
@@ -171,6 +160,7 @@ pub(crate) fn capabilities() -> Capabilities {
         // 伙伴代发署名不声明（不在这一版范围）；性能自报由运行时替插件声明。
         agent_attribution: Default::default(),
         perf: false,
+        store_read: true,
     }
 }
 
@@ -262,15 +252,14 @@ mod tests {
             result["capabilities"]["messages"]["forwarded"], true,
             "当前加密消息格式没有转发快照，不声明尚未实现的能力"
         );
-        assert_eq!(result["platform"]["history"], "server");
-        assert_eq!(result["platform"]["pageMax"], 100);
+        assert_eq!(result["platform"]["history"], "none", "服务器不存消息");
         assert_eq!(
-            result["capabilities"]["messages"]["list"], true,
-            "history=server 必须能读消息（§5.2）"
+            result["capabilities"]["storeRead"], true,
+            "设备之间对账要读回自己存在宿主的原件"
         );
         assert_eq!(
-            result["capabilities"]["conversations"]["recentActivity"], true,
-            "声明了会话发现就要能答"
+            result["capabilities"]["events"]["messages"], true,
+            "history=none 必须推消息（§5.2）"
         );
         assert_eq!(result["settings"][0]["default"], DEFAULT_SERVER);
         assert_eq!(

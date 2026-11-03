@@ -244,7 +244,7 @@ impl Server {
             return None;
         }
         ui.step(recovery_key(
-            "Cindy IM 已开通。这是你的恢复密钥：所有电脑都丢了时，只有它能找回聊天记录。它只显示这一次，请抄在纸上，或存进密码管理器。",
+            "Cindy IM 已开通。这是你的恢复密钥：所有电脑都丢了时，只有它能找回账号（聊天记录只在你们的设备上，服务器没有）。它只显示这一次，请抄在纸上，或存进密码管理器。",
             &key.to_words(),
         ));
         // 宿主关掉、断了也往下走：凭据已经存好。
@@ -336,7 +336,7 @@ impl Server {
                                             ui.fail(Some("没能登录"), "批准了，但这台电脑没能取回钥匙。", Some("重新请求"));
                                             return None;
                                         }
-                                        return self.saved(ui, client, new_credential, ("这台电脑已加入", "会话列表马上出现，历史消息在后台补齐。你的其它电脑也会收到提醒。")).await;
+                                        return self.saved(ui, client, new_credential, ("这台电脑已加入", "会话列表马上出现。有旧电脑或聊天对象在线时，历史消息和文件在后台补齐。你的其它电脑也会收到提醒。")).await;
                                     }
                                     JoinCloseReason::Rejected => {
                                         ui.fail(Some("没有批准"), "那台电脑拒绝了这次请求。如果不是你本人在操作，可能有人登录了你的 Cindy 账号，请尽快修改 Cindy 密码。", Some("重新请求"));
@@ -376,7 +376,7 @@ impl Server {
                                 ui.step(waiting("正在核对恢复密钥…"));
                                 match client.join_with_recovery(text).await {
                                     Ok(()) => {
-                                        return self.saved(ui, client, new_credential, ("这台电脑已加入", "会话列表马上出现，历史消息在后台补齐。你的其它电脑也会收到提醒。")).await;
+                                        return self.saved(ui, client, new_credential, ("这台电脑已加入", "会话列表马上出现。有旧电脑或聊天对象在线时，历史消息和文件在后台补齐。你的其它电脑也会收到提醒。")).await;
                                     }
                                     Err(error) => {
                                         tracing::info!(%error, "用恢复密钥加入没成");

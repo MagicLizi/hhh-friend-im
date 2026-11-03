@@ -1,10 +1,10 @@
 //! 格式夹具：锁住第 1 版的线上格式。
 //!
 //! 插件和服务器都按同一个 core 编译，两边当下总是对得上；这里防的是以后改代码时格式悄悄变了——
-//! 服务器里、用户手里的旧数据就再也验不过、解不开。夹具里有两类东西：
+//! 用户手里的旧数据就再也验不过、解不开。夹具里有两类东西：
 //!
 //! - 固定输入算出来的（编号、签名链一环、恢复密钥的两种写法、一帧请求）：每次重算，必须一字不差；
-//! - 事先存好的密文（消息、封装的账号钥匙、文件）：加密带随机数，存一份当时的结果，现在的代码必须还解得开。
+//! - 事先存好的密文（消息、封装的账号钥匙）：加密带随机数，存一份当时的结果，现在的代码必须还解得开。
 //!
 //! 只有有意改格式（同时把对应的版本号加 1）时才重新生成：
 //! `FRIEND_IM_WRITE_FIXTURES=1 cargo test -p friend-im-core --test format_v1`
@@ -33,7 +33,6 @@ struct Fixture {
     envelope: Envelope,
     message: MessageBody,
     account_seed_box: Sealed,
-    file_sealed: Bytes,
 }
 
 // 固定的输入：钥匙材料都是写死的字节，只用于夹具。
@@ -57,7 +56,6 @@ fn uid() -> Uid {
     Uid::from_cindy("https://auth.cindy.app", "mem_fixture")
 }
 const FILE_KEY: [u8; 32] = [0x66; 32];
-const FILE_PLAIN: &str = "文件内容：第 1 版格式夹具。";
 
 fn eldest() -> AccountLink {
     let entry = DeviceEntry { keys: device().public(), name: "夹具电脑".into(), kind: DeviceKind::Computer };
@@ -112,7 +110,6 @@ fn generate() -> Fixture {
         envelope,
         message: message(),
         account_seed_box: crypto::seal_to(&device.public().enc.0, &info, account_seed().as_bytes()).unwrap(),
-        file_sealed: Bytes(file::seal_all(&FILE_KEY, FILE_PLAIN.as_bytes())),
     }
 }
 
@@ -143,20 +140,6 @@ fn version_1_formats_have_not_drifted() {
     let info = account_seed_info(&uid(), 0, 1, &device().id());
     let opened = device().open(&info, &fixture.account_seed_box).expect("存好的账号钥匙封装打不开了");
     assert_eq!(opened.as_slice(), account_seed().as_bytes());
-    assert_eq!(file::open_all(&FILE_KEY, &fixture.file_sealed.0).unwrap().as_slice(), FILE_PLAIN.as_bytes(), "存好的文件解不开了");
-}
-
-/// 第 1 版之后加的可选字段（历史请求的时间窗口）：不带时与第 1 版的帧一字不差，第 1 版的帧照样读得懂。
-#[test]
-fn later_optional_fields_keep_version_1_frames() {
-    let conv = conv();
-    let old = format!(r#"{{"op":"history","conv":"{conv}","before":5,"limit":50}}"#);
-    let plain = Request::History { conv: conv.clone(), before: Some(5), limit: 50, since_ms: None, until_ms: None };
-    assert_eq!(serde_json::to_string(&plain).unwrap(), old, "不带时间窗口的历史请求变了");
-    assert_eq!(serde_json::from_str::<Request>(&old).unwrap(), plain, "第 1 版的历史请求读不懂了");
-    let windowed = Request::History { conv, before: None, limit: 50, since_ms: Some(1_700_000_000_000), until_ms: Some(1_700_000_000_999) };
-    let text = serde_json::to_string(&windowed).unwrap();
-    assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), windowed);
 }
 
 /// 个人资料后加的加密头像文件（`photo`，0.4.0）：不带时与旧版写的一字不差，旧版写的照样读得懂；带了读回不走样。
@@ -172,6 +155,7 @@ fn a_profile_photo_keeps_older_profiles() {
         size: 2_048,
         name: "avatar.png".into(),
         mime: "image/png".into(),
+        sha256: None,
     };
     let with_photo = Content::Profile { avatar: None, photo: Some(photo) };
     let text = serde_json::to_string(&with_photo).unwrap();

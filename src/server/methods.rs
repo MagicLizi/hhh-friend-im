@@ -1,24 +1,21 @@
-//! 读取与动作（protocol-v1 §8、§10）：会话、成员、名字、会话发现、翻历史、发消息、撤回。
+//! 读取与动作（protocol-v1 §8、§10）：会话、成员、名字、发消息、撤回。消息历史不在这里读：平台是 `history = none`，
+//! 消息由设备对账补齐后推给宿主（[`super::devices`]）。
 //!
-//! - 翻历史只能从新往旧（服务器按日志序号往前翻），HHH 读消息也一直是这样读；游标是日志序号（`translate::cursor`）。
-//!   一页里除了消息还有系统提示，合起来不超过宿主要的条数，多出来的留给下一页。
-//! - 发消息一条一条发（第一阶段线上验收的教训：并发发送会挤满客户端的推送队列）。消息编号由账号与 `operationId`
-//!   算出来：同一次发送重试还是同一条，服务器按编号去重。附件大、60 秒内发不完时先回“不确定”，发完的结果在
-//!   `messages/lookupSend` 里取。
+//! - 发消息一条一条发。消息编号由账号与 `operationId` 算出来：同一次发送重试还是同一条，所有设备按编号去重。
+//!   本机宿主保存成功就算发出，对方不在线时等对账送达。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use friend_im_client::core::bytes::Fixed;
+use friend_im_client::core::crypto;
 use friend_im_client::core::file::FileRef;
-use friend_im_client::core::ids::{ConvId, MsgId, Uid};
-use friend_im_client::core::limits::HISTORY_PAGE_MAX;
+use friend_im_client::core::ids::{ConvId, FileId, MsgId, Uid};
 use friend_im_client::core::message::{COVER_MAX, Content, Part, VideoInfo};
-use friend_im_client::core::wire::ConvActivity;
-use friend_im_client::{ClientError, HistoryItem};
+use friend_im_client::core::sync::{Key, read_position};
 use hhh_im_protocol::method::{
-    ActivityItem, ConversationsGetParams, ConversationsListParams, MembersParams,
-    MessagesListParams, MessagesLookupSendParams, MessagesRecallParams, MessagesSendParams, Page,
-    PeopleGetParams, PeopleGetResult, RecentActivityParams, RecentActivityResult,
+    ConversationsGetParams, ConversationsListParams, MembersParams, MessagesLookupSendParams,
+    MessagesRecallParams, MessagesSendParams, Page, PeopleGetParams, PeopleGetResult,
 };
 use hhh_im_protocol::rpc::{ErrorKind, RpcError};
 use hhh_im_protocol::types::{OutgoingVideo, Person, PersonKind, SendOutcome, SendTarget};
@@ -26,15 +23,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use super::session::Live;
 use super::translate::{self, Piece};
-use super::{Server, errors, push};
+use super::{Server, errors};
 
 /// 记住多少次发送的结果（同一个 `operationId` 再来时回同一个结果）。
 const SENDS_MAX: usize = 1000;
-
-/// 会话发现时一个会话至多翻几页历史（一页 [`HISTORY_PAGE_MAX`] 条，平时一页就到头）。
-const ACTIVITY_PAGES: usize = 3;
 
 type SendResult = Result<Value, RpcError>;
 
@@ -313,97 +306,6 @@ impl Server {
         Ok(to_value(PeopleGetResult { found, missing }))
     }
 
-    /// `conversations/recentActivity`：服务器一次给全（至多 1000 个会话），只有编号与时间。服务器解不开内容，个人资料这类
-    /// 不给人看的也算进去，所以再翻一下这段历史，只报有人发了消息的（[`Seen`]）；私聊只有别人发过时才带对方编号。
-    pub(crate) async fn conversations_recent_activity(
-        &self,
-        params: RecentActivityParams,
-    ) -> Result<Value, RpcError> {
-        let live = self.live().await?;
-        let activity = live
-            .client
-            .activity(params.since_ms)
-            .await
-            .map_err(|e| errors::client(&e))?;
-        let mut items = Vec::with_capacity(activity.len());
-        for item in activity {
-            let Ok(conversation) = live.conversation(&item.conv).await else {
-                continue;
-            };
-            let seen = match seen_since(&live, &item, params.since_ms).await {
-                Ok(Some(seen)) => seen,
-                Ok(None) => {
-                    tracing::debug!(conv = %item.conv, "这段时间只有不给人看的（个人资料、撤回、换钥匙），不算有新消息");
-                    continue;
-                }
-                Err(error @ (ClientError::Disconnected | ClientError::Timeout)) => {
-                    return Err(errors::client(&error));
-                }
-                Err(error) => {
-                    tracing::info!(conv = %item.conv, %error, "这段历史翻不了，按服务器给的算");
-                    Seen::reported(&item)
-                }
-            };
-            items.push(ActivityItem {
-                first_page: None,
-                conversation: None,
-                conversation_id: item.conv.to_string(),
-                kind: conversation.kind,
-                first_ms: seen.first_ms,
-                latest_ms: seen.latest_ms,
-                peer_id: conversation.peer.filter(|_| seen.others),
-            });
-        }
-        items.sort_by_key(|item| std::cmp::Reverse(item.latest_ms));
-        Ok(to_value(RecentActivityResult {
-            items,
-            complete: true,
-        }))
-    }
-
-    /// `messages/list`：从新往旧翻一页，页里按从旧到新排。
-    pub(crate) async fn messages_list(
-        &self,
-        params: MessagesListParams,
-    ) -> Result<Value, RpcError> {
-        let live = self.live().await?;
-        let conv = conv_id(&params.conversation_id)?;
-        if params.thread_id.is_some() {
-            return Ok(to_value(Page::<()> {
-                items: Vec::new(),
-                next: None,
-            }));
-        }
-        if !params.newest_first {
-            return Err(errors::of(
-                ErrorKind::Unsupported,
-                "Cindy IM 只能从新往旧翻历史。",
-            ));
-        }
-        let before = match params.cursor.as_deref() {
-            None => None,
-            Some(text) => Some(
-                translate::parse_cursor(text)
-                    .ok_or_else(|| errors::of(ErrorKind::InvalidRequest, "翻页游标不对。"))?,
-            ),
-        };
-        let limit = usize::from(params.limit.max(1)).min(translate_page_max());
-        let page = live
-            .client
-            .history_in(
-                &conv,
-                before,
-                limit as u32,
-                params.after_ms,
-                params.before_ms,
-            )
-            .await
-            .map_err(|e| errors::client(&e))?;
-        Ok(to_value(
-            history_page(&live, &conv, page.items, page.more, limit).await,
-        ))
-    }
-
     /// `messages/send`：同一个操作编号只发一次；60 秒内没发完先回“不确定”。
     pub(crate) async fn messages_send(
         self: &Arc<Self>,
@@ -449,7 +351,7 @@ impl Server {
         }
     }
 
-    /// 真的发：附件先加密上传，再一条一条发。没连上服务器时不知道服务器收没收到，回“不确定”（不自己重发）。
+    /// 真的发：附件换成文件引用，再一条一条发。本机宿主没保存成功才算失败（宿主记成“没有发出去”、能重试）。
     async fn send_now(&self, params: MessagesSendParams) -> SendResult {
         let live = self.live().await?;
         let (conv, reply_to) = match &params.target {
@@ -471,12 +373,9 @@ impl Server {
             match piece {
                 Piece::Part(part) => parts.push(part),
                 Piece::Attachment { key, image, video } => {
-                    parts.push(
-                        self.upload_attachment(&live, &conv, &key, image, video.as_ref())
-                            .await?,
-                    );
+                    parts.push(self.attachment_part(&key, image, video.as_ref()).await?);
                     used.push(key);
-                    // 封面传没传上去，发出去后暂存都不要了（没传上的这条就不带封面）。
+                    // 封面带没带上，发出去后暂存都不要了。
                     used.extend(video.and_then(|v| v.cover));
                 }
             }
@@ -488,27 +387,12 @@ impl Server {
         let id = send_id(&live.me, &params.operation_id);
         let sent = {
             let _turn = self.sends.gate.lock().await;
-            // 没连着服务器：一定没发出去，回可以重试的错误（契约 S19），宿主记成“没有发出去”、能重试；
-            // 发出去之后才断的才说不确定。
-            if !live.client.connected() {
-                tracing::info!(%conv, "发送时没连着服务器，没有发出去");
-                return Err(errors::client(&ClientError::Disconnected));
-            }
-            live.client.send(&conv, &id, content).await
+            live.devices.send(&conv, &id, content).await
         };
-        let (_, ts_ms) = match sent {
-            Ok(sent) => sent,
-            Err(error @ (ClientError::Disconnected | ClientError::Timeout)) => {
-                tracing::info!(%conv, %error, "发送时没连上服务器，不知道发出去没有");
-                return Ok(to_value(SendOutcome::Unknown {
-                    reason: "没连上 Cindy IM 服务器，不知道发出去没有。".into(),
-                }));
-            }
-            Err(error) => {
-                tracing::info!(%conv, %error, "发送被拒");
-                return Err(errors::client(&error));
-            }
-        };
+        let at = sent.map_err(|error| {
+            tracing::info!(%conv, %error, "发送没成");
+            errors::client(&error)
+        })?;
         for key in used {
             self.uploads.done(&key).await;
         }
@@ -518,27 +402,26 @@ impl Server {
             _ => None,
         }));
         let names = live.names(uids).await;
-        let message = translate::posted(
+        let mut message = translate::posted(
             conv.as_str(),
             &id,
             &live.me,
-            ts_ms,
+            at,
             &parts,
             reply_to.as_ref(),
             &names,
         );
-        live.remember(&message.id, &live.me, ts_ms);
+        message.read_position = Some(read_position(&Key { at, id }));
         Ok(to_value(SendOutcome::Accepted {
             message: Box::new(message),
         }))
     }
 
-    /// 暂存的附件：读宽高（图片），加密上传到这个会话，换成消息正文里的一段。视频文件带宿主给的视频信息时，
-    /// 封面也加密上传成同一会话里的一个文件（契约 friend/video-preview v3）；封面传不上去这条照常发，只是不带封面。
-    async fn upload_attachment(
+    /// 暂存的附件：读宽高（图片），换成消息正文里的一段。文件本身不离开这台设备：宿主发送成功后存进文件库，
+    /// 别的设备要时从这里取。内容摘要写进文件引用、随消息签名。视频文件带宿主给的视频信息时封面也一样（契约
+    /// friend/video-preview v3）；封面有问题这条照常发，只是不带封面。
+    async fn attachment_part(
         &self,
-        live: &Live,
-        conv: &ConvId,
         key: &str,
         image: bool,
         video: Option<&OutgoingVideo>,
@@ -551,21 +434,10 @@ impl Server {
         let (head, size) = read_head(attachment.path.clone()).await;
         let image = image || attachment.image;
         let mime = mime_of(&attachment.name, image, &head);
-        let file = std::fs::File::open(&attachment.path).map_err(|error| {
-            tracing::error!(%error, "打不开暂存的附件");
-            errors::of(ErrorKind::NotFound, "附件已经过期，要重新上传。")
-        })?;
-        let uploaded = live
-            .client
-            .upload(conv, file, attachment.bytes, &attachment.name, &mime)
-            .await
-            .map_err(|error| {
-                tracing::info!(%conv, %error, "附件上传没成");
-                errors::client(&error)
-            })?;
+        let file = file_ref(attachment.bytes, &attachment.name, &mime, attachment.sha256);
         if image {
             return Ok(Part::Image {
-                file: uploaded,
+                file,
                 width: size.map(|s| s.width as u32),
                 height: size.map(|s| s.height as u32),
             });
@@ -573,7 +445,7 @@ impl Server {
         let video = match video {
             Some(video) => {
                 let cover = match &video.cover {
-                    Some(cover) => self.upload_cover(live, conv, cover).await,
+                    Some(cover) => self.cover_ref(cover).await,
                     None => None,
                 };
                 Some(VideoInfo {
@@ -586,21 +458,18 @@ impl Server {
             }
             None => None,
         };
-        Ok(Part::File {
-            file: uploaded,
-            video,
-        })
+        Ok(Part::File { file, video })
     }
 
-    /// 视频封面：要是暂存好的 JPEG、PNG 或 WebP、不超过 [`COVER_MAX`]，加密上传成这个会话里的一个文件。
+    /// 视频封面：要是暂存好的 JPEG、PNG 或 WebP、不超过 [`COVER_MAX`]。宿主不保存发出去的封面，字节留在内存里给别的设备。
     /// 哪一步不行都只记一笔、不带封面（封面只是锦上添花，不让视频发不出去）。
-    async fn upload_cover(&self, live: &Live, conv: &ConvId, key: &str) -> Option<FileRef> {
+    async fn cover_ref(&self, key: &str) -> Option<FileRef> {
         let Some(attachment) = self.uploads.attachment(key).await else {
-            tracing::warn!(%conv, "视频封面的暂存找不到，这条不带封面");
+            tracing::warn!("视频封面的暂存找不到，这条不带封面");
             return None;
         };
         if attachment.bytes > COVER_MAX {
-            tracing::warn!(%conv, bytes = attachment.bytes, "视频封面太大，这条不带封面");
+            tracing::warn!(bytes = attachment.bytes, "视频封面太大，这条不带封面");
             return None;
         }
         let (head, _) = read_head(attachment.path.clone()).await;
@@ -609,31 +478,23 @@ impl Server {
             Ok(imagesize::ImageType::Png) => "image/png",
             Ok(imagesize::ImageType::Webp) => "image/webp",
             _ => {
-                tracing::warn!(%conv, "视频封面不是 JPEG、PNG 或 WebP，这条不带封面");
+                tracing::warn!("视频封面不是 JPEG、PNG 或 WebP，这条不带封面");
                 return None;
             }
         };
-        let file = match std::fs::File::open(&attachment.path) {
-            Ok(file) => file,
+        let bytes = match std::fs::read(&attachment.path) {
+            Ok(bytes) => bytes,
             Err(error) => {
                 tracing::warn!(%error, "打不开暂存的视频封面，这条不带封面");
                 return None;
             }
         };
-        match live
-            .client
-            .upload(conv, file, attachment.bytes, &attachment.name, mime)
-            .await
-        {
-            Ok(cover) => Some(cover),
-            Err(error) => {
-                tracing::warn!(%conv, %error, "视频封面上传没成，这条不带封面");
-                None
-            }
-        }
+        let file = file_ref(attachment.bytes, &attachment.name, mime, attachment.sha256);
+        self.avatars.remember(&translate::resource_key(&file), Arc::new(bytes));
+        Some(file)
     }
 
-    /// `messages/recall`：撤回自己的一条（服务器上的密文随之删除）。
+    /// `messages/recall`：撤回自己的一条（所有设备上的原文随之换成墓碑）。
     pub(crate) async fn messages_recall(
         &self,
         params: MessagesRecallParams,
@@ -642,8 +503,8 @@ impl Server {
         let conv = conv_id(&params.conversation_id)?;
         let target = msg_id(&params.message_id)?;
         let _turn = self.sends.gate.lock().await;
-        live.client
-            .recall(&conv, &MsgId::random(), &target)
+        live.devices
+            .recall(&conv, &target)
             .await
             .map_err(|error| {
                 tracing::info!(%conv, %error, "撤回没成");
@@ -653,258 +514,21 @@ impl Server {
     }
 }
 
-fn translate_page_max() -> usize {
-    super::declare::PAGE_MAX as usize
-}
-
-/// 一个会话在一段时间里有人发的消息（[`translate::activity_of`]）：最早、最新一条的时间，其中有没有别人发的。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Seen {
-    first_ms: i64,
-    latest_ms: i64,
-    others: bool,
-}
-
-impl Seen {
-    /// 服务器报的原样（看不了历史时用）：当作别人发的，宁可多报一次也不漏掉真消息。
-    fn reported(item: &ConvActivity) -> Self {
-        Self {
-            first_ms: item.first_ms,
-            latest_ms: item.latest_ms,
-            others: true,
-        }
+/// 一个新文件的引用：编号和随机值由这台设备取。
+fn file_ref(size: u64, name: &str, mime: &str, sha256: [u8; 32]) -> FileRef {
+    FileRef {
+        id: FileId::random(),
+        key: Fixed(crypto::random()),
+        size,
+        name: name.to_owned(),
+        mime: mime.to_owned(),
+        sha256: Some(Fixed(sha256)),
     }
-
-    /// 把翻到的一页记进来。
-    fn add(seen: Option<Self>, items: &[HistoryItem], me: &Uid) -> Option<Self> {
-        items
-            .iter()
-            .filter_map(|item| translate::activity_of(item, me))
-            .fold(seen, |seen, (at, sender)| {
-                let others = sender != me;
-                Some(match seen {
-                    None => Self {
-                        first_ms: at,
-                        latest_ms: at,
-                        others,
-                    },
-                    Some(s) => Self {
-                        first_ms: s.first_ms.min(at),
-                        latest_ms: s.latest_ms.max(at),
-                        others: s.others || others,
-                    },
-                })
-            })
-    }
-}
-
-/// 服务器说这个会话 `since_ms` 起有动静：从新往旧翻这段历史，看其中有没有人发的消息（与翻历史同一套“给不给人看”）。
-/// 翻满 [`ACTIVITY_PAGES`] 页还没到头时，最早一条按服务器给的算（宁可多算未读）；一条给人看的都没翻到，就按服务器给的报。
-async fn seen_since(
-    live: &Live,
-    item: &ConvActivity,
-    since_ms: i64,
-) -> Result<Option<Seen>, ClientError> {
-    let mut seen = None;
-    let mut before = None;
-    for _ in 0..ACTIVITY_PAGES {
-        let page = live
-            .client
-            .history_in(&item.conv, before, HISTORY_PAGE_MAX, Some(since_ms), None)
-            .await?;
-        seen = Seen::add(seen, &page.items, &live.me);
-        before = page.items.iter().map(HistoryItem::log).min();
-        if !page.more || before.is_none() {
-            return Ok(seen);
-        }
-    }
-    Ok(Some(match seen {
-        Some(seen) => Seen {
-            first_ms: seen.first_ms.min(item.first_ms),
-            ..seen
-        },
-        None => Seen::reported(item),
-    }))
-}
-
-/// 一页历史（客户端库给的，从新到旧）→ 协议的一页（从旧到新）。消息与系统提示合起来不超过 `limit` 条：
-/// 多出来的（更早的）留给下一页，游标停在留下的最早一条。撤回动作本身、不用给人看的提示不占条数。
-pub(crate) async fn history_page(
-    live: &Live,
-    conv: &ConvId,
-    items: Vec<HistoryItem>,
-    more: bool,
-    limit: usize,
-) -> Page<hhh_im_protocol::types::Message> {
-    let mut uids = Vec::new();
-    for item in &items {
-        match item {
-            HistoryItem::Message(m) => uids.extend(push::mentioned(m)),
-            HistoryItem::Rejected { sender, .. } => uids.push(sender.clone()),
-            HistoryItem::Notice(n) => uids.extend(translate::notice_people(n)),
-        }
-    }
-    let names = live.names(uids).await;
-    let mut kept = Vec::new();
-    let mut truncated = false;
-    let mut oldest = None;
-    for item in &items {
-        // 翻到的个人资料照记（新电脑、重启后从历史里重新认识别人的头像）。
-        if let HistoryItem::Message(m) = item
-            && let Some(Content::Profile { avatar, photo }) = &m.content
-        {
-            let key = super::profile::profile_key(avatar.as_deref(), photo.as_ref());
-            push::profile_seen(live, &m.sender, m.log, key).await;
-        }
-        let wire = match item {
-            HistoryItem::Message(m) => translate::message(m, &names),
-            HistoryItem::Rejected {
-                id, ts_ms, sender, ..
-            } => Some(translate::unreadable(
-                conv.as_str(),
-                id,
-                sender,
-                *ts_ms,
-                &names,
-            )),
-            HistoryItem::Notice(n) => translate::notice(n, &names, &live.me),
-        };
-        if let Some(wire) = wire {
-            if kept.len() == limit {
-                truncated = true;
-                break;
-            }
-            if let HistoryItem::Message(m) = item {
-                live.remember(&wire.id, &m.sender, m.ts_ms);
-            }
-            kept.push(wire);
-        }
-        oldest = Some(item.log());
-    }
-    let next = (truncated || more)
-        .then(|| oldest.map(translate::cursor))
-        .flatten();
-    kept.reverse();
-    Page { items: kept, next }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use friend_im_client::core::bytes::Fixed;
-    use friend_im_client::core::ids::{DeviceId, InviteId};
-    use friend_im_client::{ConvNotice, Message, Notice};
-
-    fn uid(n: u8) -> Uid {
-        Uid::from_raw([n; 16])
-    }
-
-    fn message(log: u64, ts_ms: i64, sender: u8, content: Option<Content>) -> HistoryItem {
-        HistoryItem::Message(Message {
-            conv: ConvId::from_raw([1; 16]),
-            id: MsgId::from_raw([log as u8; 16]),
-            log,
-            ts_ms,
-            sender: uid(sender),
-            sender_eldest: Fixed([0; 32]),
-            device: DeviceId::from_raw([sender; 16]),
-            ctime_ms: ts_ms,
-            content,
-        })
-    }
-
-    fn post(log: u64, ts_ms: i64, sender: u8) -> HistoryItem {
-        let parts = vec![Part::Text {
-            text: "在吗".into(),
-        }];
-        message(
-            log,
-            ts_ms,
-            sender,
-            Some(Content::Post {
-                parts,
-                reply_to: None,
-            }),
-        )
-    }
-
-    fn notice(log: u64, ctime_ms: i64, author: u8, change: ConvNotice) -> HistoryItem {
-        HistoryItem::Notice(Notice {
-            conv: ConvId::from_raw([1; 16]),
-            log,
-            ctime_ms,
-            author: uid(author),
-            change,
-        })
-    }
-
-    #[test]
-    fn what_nobody_sees_is_not_someone_sending_a_message() {
-        // 自己的电脑发的头像资料、撤回、换钥匙，以及被撤回只剩“已撤回”的那条：删掉的会话不该因为它们回来。
-        let me = uid(1);
-        let profile = Content::Profile {
-            avatar: None,
-            photo: None,
-        };
-        let recall = Content::Recall {
-            target: MsgId::from_raw([9; 16]),
-        };
-        let items = [
-            message(14, 140, 1, Some(profile.clone())),
-            message(13, 130, 2, Some(profile)),
-            message(12, 120, 2, Some(recall)),
-            message(11, 110, 2, None),
-            notice(10, 100, 2, ConvNotice::Rotated),
-        ];
-        assert_eq!(Seen::add(None, &items, &me), None);
-    }
-
-    #[test]
-    fn messages_unreadable_ones_and_shown_notices_count_with_who_sent_them() {
-        let me = uid(1);
-        // 只有自己发的：算有消息，但不是别人发的（私聊不带对方编号）。
-        let mine = [post(5, 500, 1)];
-        assert_eq!(
-            Seen::add(None, &mine, &me),
-            Some(Seen {
-                first_ms: 500,
-                latest_ms: 500,
-                others: false
-            })
-        );
-        // 对方的一条、解不开的一条、对方签的“你重置了账号”：时间取最早与最新，有别人发的。
-        let theirs = [
-            post(8, 800, 2),
-            HistoryItem::Rejected {
-                id: MsgId::from_raw([7; 16]),
-                log: 7,
-                ts_ms: 700,
-                sender: uid(2),
-                reason: "解不开".into(),
-            },
-            notice(6, 600, 2, ConvNotice::MemberReset { uid: me.clone() }),
-        ];
-        let seen = Seen::add(Seen::add(None, &mine, &me), &theirs, &me);
-        assert_eq!(
-            seen,
-            Some(Seen {
-                first_ms: 500,
-                latest_ms: 800,
-                others: true
-            })
-        );
-        // 群邀请链接的发出不给人看，不算。
-        let invite = notice(
-            9,
-            900,
-            2,
-            ConvNotice::InviteCreated {
-                invite: InviteId::from_raw([4; 16]),
-            },
-        );
-        assert_eq!(Seen::add(seen, &[invite], &me), seen);
-    }
-
     #[test]
     fn send_ids_are_stable_per_account_and_operation() {
         let me = Uid::from_raw([1; 16]);

@@ -1,4 +1,4 @@
-//! 加密的阅读水位，独立于聊天消息。服务器只保存签名信封，看不到消息边界。
+//! 加密的阅读水位，独立于聊天消息。设备之间对账时互相交换，服务器不保存。
 use crate::{
     bytes::{Bytes, Fixed},
     crypto::{self, ctx},
@@ -15,11 +15,13 @@ pub const READING_CT_MAX: usize = 1024;
 /// 只有会话成员能解开的确切阅读边界。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadingBody {
-    pub through: u64,
+    /// 读到的那条消息的发送时间（和消息排序键同一把尺子）。
+    pub at: i64,
+    /// 读到的那条消息。
     pub message: MsgId,
 }
 
-/// 每账号、会话、设备一份。revision 是该设备记录的 CAS 版本，不是阅读位置。
+/// 每账号、会话、设备一份。revision 是这台设备写的版本（毫秒时间，只增），不是阅读位置；每台设备取最大的那份。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadingEnvelope {
     pub conv: ConvId,
@@ -30,13 +32,6 @@ pub struct ReadingEnvelope {
     pub revision: u64,
     pub ct: Bytes,
     pub sig: Fixed<64>,
-}
-
-/// 服务器接受记录的日志序号供验签时核对设备有效区间；不进入旧客户端的事件流。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredReading {
-    pub log: u64,
-    pub envelope: ReadingEnvelope,
 }
 
 impl ReadingEnvelope {
@@ -60,12 +55,7 @@ impl ReadingEnvelope {
         sender: &Sender<'_>,
         body: &ReadingBody,
     ) -> Result<Self> {
-        if body.through == 0
-            || body.through > i64::MAX as u64
-            || generation == 0
-            || revision == 0
-            || revision > i64::MAX as u64
-        {
+        if body.at <= 0 || generation == 0 || revision == 0 || revision > i64::MAX as u64 {
             return Err(CoreError::format("阅读边界或记录版本无效"));
         }
         let mut value = Self {
@@ -111,7 +101,7 @@ impl ReadingEnvelope {
         let plain = crypto::decrypt(&seed.reading_key(), &self.header(), &self.ct.0)?;
         let body: ReadingBody =
             serde_json::from_slice(&plain).map_err(|_| CoreError::format("阅读边界读不懂"))?;
-        if body.through == 0 || body.through > i64::MAX as u64 {
+        if body.at <= 0 {
             return Err(CoreError::format("阅读位置无效"));
         }
         Ok(body)
@@ -135,13 +125,13 @@ mod tests {
             device: &device,
         };
         let body = ReadingBody {
-            through: 42,
+            at: 42,
             message: MsgId::random(),
         };
         let envelope = ReadingEnvelope::seal(&conv, 1, 1, &seed, &sender, &body).unwrap();
         assert_eq!(envelope.open(&seed, &device.public()).unwrap(), body);
         let wire = serde_json::to_value(&envelope).unwrap();
-        assert!(wire.get("through").is_none() && wire.get("message").is_none());
+        assert!(wire.get("at").is_none() && wire.get("message").is_none());
         assert!(
             envelope
                 .open(&ConvSeed::generate(), &device.public())
@@ -171,7 +161,7 @@ mod tests {
             eldest: Fixed([7; 32]),
             device: &device,
         };
-        for through in [0, u64::MAX] {
+        for at in [0, -1] {
             assert!(
                 ReadingEnvelope::seal(
                     &ConvId::random(),
@@ -180,7 +170,7 @@ mod tests {
                     &ConvSeed::generate(),
                     &sender,
                     &ReadingBody {
-                        through,
+                        at,
                         message: MsgId::random()
                     }
                 )

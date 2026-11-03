@@ -1,4 +1,4 @@
-//! 局域网直连通道：发现只交换设备公钥与端口，消息仍是现有 E2EE 信封。
+//! 局域网直连通道：发现只交换设备公钥与端口，传的是和服务器转交同一种端到端加密的帧。
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -7,37 +7,28 @@ use std::time::{Duration, Instant};
 
 use friend_im_core::bytes::Fixed;
 use friend_im_core::crypto;
-use friend_im_core::ids::{DeviceId, MsgId, Uid};
+use friend_im_core::ids::{DeviceId, Uid};
 use friend_im_core::keys::{DevicePublic, DeviceSecret};
-use friend_im_core::message::Envelope;
+use friend_im_core::limits;
+use friend_im_core::peer::SealedFrame;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 const DISCOVERY_PORT: u16 = 39_071;
 const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
-const DISCOVERY_VERSION: u32 = 1;
+const DISCOVERY_VERSION: u32 = 2;
 const HELLO_LABEL: &str = "FRIEND_IM_LAN_HELLO";
 const DISCOVERY_LABEL: &str = "FRIEND_IM_LAN_DISCOVERY";
 const LAN_TIMEOUT: Duration = Duration::from_millis(700);
 const PEER_TTL: Duration = Duration::from_secs(15);
-const PENDING_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct Peer {
-    uid: Uid,
-    device: DeviceId,
     addr: SocketAddr,
     seen: Instant,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DirectInbound {
-    pub env: Envelope,
-    pub log: u64,
-    pub ts_ms: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,23 +42,10 @@ enum Frame {
         nonce: Fixed<32>,
         sig: Fixed<64>,
     },
-    Offer {
-        env: Envelope,
+    Deliver {
+        frame: SealedFrame,
     },
-    Ready {
-        id: MsgId,
-    },
-    Commit {
-        id: MsgId,
-        log: u64,
-        ts_ms: i64,
-    },
-    Delivered {
-        id: MsgId,
-    },
-    Cancel {
-        id: MsgId,
-    },
+    Delivered,
     Error {
         message: String,
     },
@@ -84,11 +62,6 @@ struct Announcement {
     sig: Fixed<64>,
 }
 
-struct Pending {
-    env: Envelope,
-    created: Instant,
-}
-
 pub(crate) struct Lan {
     uid: Uid,
     device: DeviceId,
@@ -96,20 +69,26 @@ pub(crate) struct Lan {
     secret: DeviceSecret,
     port: u16,
     peers: Arc<Mutex<HashMap<DeviceId, Peer>>>,
-    pending: Arc<Mutex<HashMap<MsgId, Pending>>>,
 }
 
 impl Lan {
     pub(crate) async fn start(
         uid: Uid,
         secret: DeviceSecret,
-        inbound: mpsc::UnboundedSender<DirectInbound>,
+        inbound: mpsc::UnboundedSender<SealedFrame>,
     ) -> std::io::Result<Arc<Self>> {
         // WASI 构建（手机上由宿主解释执行）不做局域网直连：没有组播，也不在手机上开监听端口；调用方照原有设计改走服务器中转。
         if cfg!(target_os = "wasi") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "WASI 构建不做局域网直连",
+            ));
+        }
+        // 同一台电脑上的几个测试实例要模拟“互相不通”时用：不发现、不监听，只走服务器转交。
+        if std::env::var_os("FRIEND_IM_NO_LAN").is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "局域网直连被 FRIEND_IM_NO_LAN 关掉了",
             ));
         }
         let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
@@ -122,7 +101,6 @@ impl Lan {
             secret,
             port,
             peers: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashMap::new())),
         });
         let accepting = lan.clone();
         tokio::spawn(async move {
@@ -157,7 +135,6 @@ impl Lan {
             secret,
             port: 0,
             peers: Arc::new(Mutex::new(HashMap::new())),
-            pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -174,83 +151,19 @@ impl Lan {
         }
     }
 
-    fn candidates(&self, members: &[Uid], allowed_devices: &[DeviceId]) -> Vec<Peer> {
+    /// 直接交给这台设备：发现过它、连得上、对方确认收下才算送到。
+    pub(crate) async fn deliver(&self, to: &DeviceId, frame: &SealedFrame) -> bool {
         let now = Instant::now();
-        self.peers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .filter(|peer| {
-                peer.device != self.device
-                    && members.iter().any(|uid| uid == &peer.uid)
-                    && allowed_devices.iter().any(|id| id == &peer.device)
-                    && now.duration_since(peer.seen) <= PEER_TTL
-            })
-            .cloned()
-            .collect()
-    }
-
-    pub(crate) async fn offer(
-        &self,
-        env: &Envelope,
-        members: &[Uid],
-        allowed_devices: &[DeviceId],
-    ) -> Vec<DeviceId> {
-        let hello = self.hello();
-        let mut ready = Vec::new();
-        for peer in self.candidates(members, allowed_devices) {
-            if offer_one(peer.addr, &hello, env).await {
-                ready.push(peer.device);
-            }
-        }
-        ready
-    }
-
-    pub(crate) async fn commit(
-        &self,
-        id: &MsgId,
-        log: u64,
-        ts_ms: i64,
-        devices: &[DeviceId],
-    ) -> Vec<DeviceId> {
-        let hello = self.hello();
-        let now = Instant::now();
-        let peers: Vec<_> = self
+        let peer = self
             .peers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .filter(|peer| {
-                devices.iter().any(|want| want == &peer.device)
-                    && now.duration_since(peer.seen) <= PEER_TTL
-            })
-            .cloned()
-            .collect();
-        let mut delivered = Vec::new();
-        for peer in peers {
-            if commit_one(peer.addr, &hello, id, log, ts_ms).await {
-                delivered.push(peer.device);
-            }
-        }
-        delivered
-    }
-
-    pub(crate) async fn cancel(&self, id: &MsgId, devices: &[DeviceId]) {
-        let hello = self.hello();
-        let now = Instant::now();
-        let peers: Vec<_> = self
-            .peers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .filter(|peer| {
-                devices.iter().any(|want| want == &peer.device)
-                    && now.duration_since(peer.seen) <= PEER_TTL
-            })
-            .cloned()
-            .collect();
-        for peer in peers {
-            let _ = cancel_one(peer.addr, &hello, id).await;
+            .get(to)
+            .filter(|peer| now.duration_since(peer.seen) <= PEER_TTL)
+            .cloned();
+        match peer {
+            Some(peer) => deliver_one(peer.addr, &self.hello(), frame).await,
+            None => false,
         }
     }
 
@@ -258,10 +171,11 @@ impl Lan {
         &self,
         stream: TcpStream,
         addr: SocketAddr,
-        inbound: mpsc::UnboundedSender<DirectInbound>,
+        inbound: mpsc::UnboundedSender<SealedFrame>,
     ) -> std::io::Result<()> {
         let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
+        // 一帧不超过连接帧上限的两倍：对方写什么也撑不爆内存。
+        let mut reader = BufReader::new(reader.take(2 * limits::FRAME_MAX_BYTES as u64));
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         let Frame::Hello {
@@ -283,8 +197,6 @@ impl Lan {
             self.peers.lock().unwrap_or_else(|p| p.into_inner()).insert(
                 device.clone(),
                 Peer {
-                    uid: uid.clone(),
-                    device: device.clone(),
                     addr: SocketAddr::new(addr.ip(), port),
                     seen: Instant::now(),
                 },
@@ -295,59 +207,17 @@ impl Lan {
         match serde_json::from_str::<Frame>(line.trim())
             .map_err(|error| invalid_data(error.to_string()))?
         {
-            Frame::Offer { env } => {
-                if env.sender != uid || env.device != device || env.ct.is_empty() {
-                    return Err(invalid_data("局域网信封发送方不一致"));
+            Frame::Deliver { frame } => {
+                if frame.uid != uid || frame.from != device || frame.to != self.device {
+                    return Err(invalid_data("局域网帧的发送方或接收方不一致"));
                 }
-                let id = env.id.clone();
-                {
-                    let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-                    let now = Instant::now();
-                    pending.retain(|_, value| now.duration_since(value.created) <= PENDING_TTL);
-                    if pending.len() >= 1024 {
-                        return Err(invalid_data("局域网暂存已满"));
-                    }
-                    pending.insert(id.clone(), Pending { env, created: now });
-                }
-                write_frame(&mut writer, &Frame::Ready { id }).await?;
-            }
-            Frame::Commit { id, log, ts_ms } => {
-                let pending = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&id);
-                if let Some(pending) =
-                    pending.filter(|p| Instant::now().duration_since(p.created) <= PENDING_TTL)
-                {
-                    inbound
-                        .send(DirectInbound {
-                            env: pending.env,
-                            log,
-                            ts_ms,
-                        })
-                        .map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "receiving client has stopped",
-                            )
-                        })?;
-                    write_frame(&mut writer, &Frame::Delivered { id }).await?;
-                } else {
-                    write_frame(
-                        &mut writer,
-                        &Frame::Error {
-                            message: "局域网暂存已过期".into(),
-                        },
+                inbound.send(frame).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "receiving client has stopped",
                     )
-                    .await?;
-                }
-            }
-            Frame::Cancel { id } => {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&id);
+                })?;
+                write_frame(&mut writer, &Frame::Delivered).await?;
             }
             _ => return Err(invalid_data("局域网请求顺序不对")),
         }
@@ -366,7 +236,7 @@ impl Lan {
                     let Ok(announcement) = serde_json::from_slice::<Announcement>(&buf[..len]) else { continue };
                     if announcement.version != DISCOVERY_VERSION || announcement.device == self.device || announcement.public.id() != announcement.device { continue; }
                     if announcement.public.verify(DISCOVERY_LABEL, &announcement_data(&announcement), &announcement.sig).is_err() { continue; }
-                    self.peers.lock().unwrap_or_else(|p| p.into_inner()).insert(announcement.device.clone(), Peer { uid: announcement.uid, device: announcement.device, addr: SocketAddr::new(addr.ip(), announcement.port), seen: Instant::now() });
+                    self.peers.lock().unwrap_or_else(|p| p.into_inner()).insert(announcement.device.clone(), Peer { addr: SocketAddr::new(addr.ip(), announcement.port), seen: Instant::now() });
                 }
                 _ = tick.tick() => {
                     let nonce = Fixed(crypto::random());
@@ -381,14 +251,14 @@ impl Lan {
     }
 }
 
-async fn offer_one(addr: SocketAddr, hello: &Frame, env: &Envelope) -> bool {
+async fn deliver_one(addr: SocketAddr, hello: &Frame, frame: &SealedFrame) -> bool {
     let Ok(stream) = tokio::time::timeout(LAN_TIMEOUT, TcpStream::connect(addr)).await else {
         return false;
     };
     let Ok(stream) = stream else { return false };
     let (reader, mut writer) = stream.into_split();
     if write_frame(&mut writer, hello).await.is_err()
-        || write_frame(&mut writer, &Frame::Offer { env: env.clone() })
+        || write_frame(&mut writer, &Frame::Deliver { frame: frame.clone() })
             .await
             .is_err()
     {
@@ -399,49 +269,7 @@ async fn offer_one(addr: SocketAddr, hello: &Frame, env: &Envelope) -> bool {
     let Ok(Ok(_)) = tokio::time::timeout(LAN_TIMEOUT, reader.read_line(&mut line)).await else {
         return false;
     };
-    matches!(serde_json::from_str::<Frame>(line.trim()), Ok(Frame::Ready { id }) if id == env.id)
-}
-
-async fn commit_one(addr: SocketAddr, hello: &Frame, id: &MsgId, log: u64, ts_ms: i64) -> bool {
-    let Ok(stream) = tokio::time::timeout(LAN_TIMEOUT, TcpStream::connect(addr)).await else {
-        return false;
-    };
-    let Ok(stream) = stream else { return false };
-    let (reader, mut writer) = stream.into_split();
-    if write_frame(&mut writer, hello).await.is_err()
-        || write_frame(
-            &mut writer,
-            &Frame::Commit {
-                id: id.clone(),
-                log,
-                ts_ms,
-            },
-        )
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let Ok(Ok(_)) = tokio::time::timeout(LAN_TIMEOUT, reader.read_line(&mut line)).await else {
-        return false;
-    };
-    matches!(serde_json::from_str::<Frame>(line.trim()), Ok(Frame::Delivered { id: received }) if received == *id)
-}
-
-async fn cancel_one(addr: SocketAddr, hello: &Frame, id: &MsgId) -> bool {
-    let Ok(stream) = tokio::time::timeout(LAN_TIMEOUT, TcpStream::connect(addr)).await else {
-        return false;
-    };
-    let Ok(stream) = stream else {
-        return false;
-    };
-    let (_reader, mut writer) = stream.into_split();
-    write_frame(&mut writer, hello).await.is_ok()
-        && write_frame(&mut writer, &Frame::Cancel { id: id.clone() })
-            .await
-            .is_ok()
+    matches!(serde_json::from_str::<Frame>(line.trim()), Ok(Frame::Delivered))
 }
 
 async fn write_frame(
@@ -496,73 +324,41 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn offer_then_commit_delivers_one_e2ee_envelope() {
+    async fn a_frame_is_delivered_once_and_only_to_a_running_client() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sender_uid = Uid::random();
-        let receiver_uid = Uid::random();
         let sender_secret = DeviceSecret::generate();
         let receiver_secret = DeviceSecret::generate();
-        let sender = Lan::start(
-            sender_uid.clone(),
-            sender_secret,
-            mpsc::unbounded_channel().0,
-        )
-        .await
-        .unwrap();
-        let receiver = Lan::start(receiver_uid.clone(), receiver_secret, tx)
-            .await
-            .unwrap();
+        let frame = SealedFrame::seal(&sender_uid, &sender_secret, &receiver_secret.public(), b"hi").unwrap();
+        let sender = Lan::start(sender_uid.clone(), sender_secret, mpsc::unbounded_channel().0).await.unwrap();
+        let receiver = Lan::start(Uid::random(), receiver_secret, tx).await.unwrap();
+        assert!(!sender.deliver(&receiver.device, &frame).await, "没发现过的设备不直连");
         sender.peers.lock().unwrap().insert(
             receiver.device.clone(),
             Peer {
-                uid: receiver_uid.clone(),
-                device: receiver.device.clone(),
                 addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.port)),
                 seen: Instant::now(),
             },
         );
-        let env = Envelope {
-            conv: friend_im_core::ids::ConvId::random(),
-            id: MsgId::random(),
-            generation: 1,
-            sender: sender_uid.clone(),
-            sender_eldest: Fixed([0; 32]),
-            device: sender.device.clone(),
-            recall: None,
-            ct: friend_im_core::bytes::Bytes(vec![1, 2, 3]),
-        };
-        let ready = sender
-            .offer(
-                &env,
-                std::slice::from_ref(&receiver_uid),
-                std::slice::from_ref(&receiver.device),
-            )
-            .await;
-        assert_eq!(ready, vec![receiver.device.clone()]);
-        let delivered = sender.commit(&env.id, 42, 99, &ready).await;
-        assert_eq!(delivered, ready);
-        let incoming = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(incoming.env, env);
-        assert_eq!((incoming.log, incoming.ts_ms), (42, 99));
-        // A stopped client must not acknowledge delivery and suppress server fallback.
+        assert!(sender.deliver(&receiver.device, &frame).await);
+        let incoming = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(incoming, frame);
+        // 收的一方停了：不算送到，发送方改走服务器转交。
         drop(rx);
-        let mut after_close = env;
-        after_close.id = MsgId::random();
-        let ready = sender
-            .offer(
-                &after_close,
-                std::slice::from_ref(&receiver_uid),
-                std::slice::from_ref(&receiver.device),
-            )
-            .await;
-        assert!(
-            sender
-                .commit(&after_close.id, 43, 100, &ready)
-                .await
-                .is_empty()
-        );
+        assert!(!sender.deliver(&receiver.device, &frame).await);
+    }
+
+    #[tokio::test]
+    async fn a_frame_claiming_another_sender_is_refused() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (a, b, c) = (DeviceSecret::generate(), DeviceSecret::generate(), DeviceSecret::generate());
+        let uid = Uid::random();
+        // 帧是 c 的，握手却是 a：局域网这一层就拒绝。
+        let frame = SealedFrame::seal(&uid, &c, &b.public(), b"hi").unwrap();
+        let sender = Lan::start(uid.clone(), a, mpsc::unbounded_channel().0).await.unwrap();
+        let receiver = Lan::start(Uid::random(), b, tx).await.unwrap();
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.port));
+        assert!(!deliver_one(addr, &sender.hello(), &frame).await);
+        assert!(rx.try_recv().is_err());
     }
 }

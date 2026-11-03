@@ -4,7 +4,7 @@
 //! - 读手：一行一条地读，宿主的请求各开一个任务并发处理（查询不被发送、上传堵住，§13），回复与插件发出的请求、
 //!   通知都排进同一条队列，由写手按顺序写（一行一条，不会搅在一起）；
 //! - 插件发给宿主的请求（`events/push`、`credential/save`）按编号等回复（[`peer`]）；`$/cancel` 停掉对应的任务；
-//! - 每个方法交给对应的模块：握手 [`declare`]、会话 [`session`]、推送 [`push`]、读取与动作 [`methods`]、
+//! - 每个方法交给对应的模块：握手 [`declare`]、会话 [`session`]、推送 [`push`]、设备之间同步 [`devices`]、读取与动作 [`methods`]、
 //!   资源与上传 [`resources`]；两边格式的翻译在 [`translate`]。
 //! - 第三阶段：用 Cindy 账号登录 [`login`]、插件操作 [`actions`]（同一时间只走一个流程，[`flow`]）、旧电脑批准与电脑增减的
 //!   提醒 [`approvals`]、加密的个人资料与头像 [`profile`]。
@@ -13,6 +13,7 @@ mod actions;
 mod approvals;
 mod contacts;
 mod declare;
+mod devices;
 mod errors;
 mod flow;
 mod friend_requests;
@@ -77,8 +78,6 @@ pub(crate) struct Server {
     pub(crate) avatars: profile::Avatars,
     /// 宿主交来的本机用户头像（`account/avatar`，契约 provider-protocol v35）；只在内存里，上线的账号共用这一份。
     pub(crate) photo: Arc<std::sync::Mutex<Option<profile::HostPhoto>>>,
-    /// 往各会话发头像一次只走一轮（宿主交头像与刚上线补发会同时来），后一轮等前一轮发完再看还要不要发。
-    pub(crate) announcing: tokio::sync::Mutex<()>,
     /// 正在处理的宿主请求（编号 → 任务），`$/cancel` 用。
     tasks: std::sync::Mutex<HashMap<String, AbortHandle>>,
 }
@@ -192,7 +191,6 @@ impl Server {
                 server_url: std::sync::Mutex::new(None),
                 avatars: profile::Avatars::default(),
                 photo: Arc::default(),
-                announcing: tokio::sync::Mutex::new(()),
                 tasks: std::sync::Mutex::new(HashMap::new()),
             }),
             writes,
@@ -323,16 +321,8 @@ impl Server {
                 Ok(p) => self.conversations_members(p).await,
                 Err(error) => Err(error),
             },
-            Method::ConversationsRecentActivity => match params(value) {
-                Ok(p) => self.conversations_recent_activity(p).await,
-                Err(error) => Err(error),
-            },
             Method::PeopleGet => match params(value) {
                 Ok(p) => self.people_get(p).await,
-                Err(error) => Err(error),
-            },
-            Method::MessagesList => match params(value) {
-                Ok(p) => self.messages_list(p).await,
                 Err(error) => Err(error),
             },
             Method::ResourcesDescribe => match params(value) {
@@ -379,7 +369,7 @@ impl Server {
                 Ok(p) => self.messages_recall(p).await,
                 Err(error) => Err(error),
             },
-            // 没声明的能力（搜索、定位私聊、读单条、表情、编辑、续期、重译）与插件发给宿主的方法。
+            // 没声明的能力（读消息、会话发现、搜索、定位私聊、表情、编辑、续期、重译）与插件发给宿主的方法。
             _ => Err(errors::method_not_found(method)),
         })
     }

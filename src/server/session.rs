@@ -24,17 +24,8 @@ use crate::credential::{self, Credential};
 
 /// 名字、会话资料缓存的条数上限：满了整个清空、按需重取（1000 个账号的规模下很少发生）。
 const CACHE_MAX: usize = 4096;
-/// 最近见过的消息（撤回推来时找原来那条的时间与发送人）记多少条。
-const RECENT_MAX: usize = 4096;
 /// 电脑增减的提醒至多留几条（契约 S4）。
 pub(crate) const DEVICE_NOTES_MAX: usize = 5;
-
-/// 最近见过的消息：编号 → （发送人，服务器时间），以及记下的先后（满了丢最早的）。
-#[derive(Default)]
-struct Recent {
-    seen: HashMap<String, (Uid, i64)>,
-    order: std::collections::VecDeque<String>,
-}
 
 /// 在线的账号。
 pub(crate) struct Live {
@@ -54,9 +45,10 @@ pub(crate) struct Live {
     pub(crate) device_notes: Mutex<Vec<(u64, String)>>,
     /// 等着推给宿主的事件（推送任务与翻历史时认识的人都往这里放）。
     pub(crate) outbox: Arc<push::Outbox>,
+    /// 设备之间同步。
+    pub(crate) devices: super::devices::Devices,
     names: Mutex<Names>,
     convs: Mutex<HashMap<ConvId, Conversation>>,
-    recent: Mutex<Recent>,
     /// 推送的两个后台任务（翻译更新、推给宿主）与发个人资料的任务，下线时停掉。
     tasks: Mutex<Vec<AbortHandle>>,
 }
@@ -172,24 +164,6 @@ impl Live {
         self.convs.lock().expect("会话缓存锁中毒").contains_key(conv)
     }
 
-    /// 记下一条见过的消息。
-    pub(crate) fn remember(&self, id: &str, sender: &Uid, ts_ms: i64) {
-        let mut recent = self.recent.lock().expect("最近消息锁中毒");
-        if recent.seen.insert(id.to_owned(), (sender.clone(), ts_ms)).is_none() {
-            recent.order.push_back(id.to_owned());
-            if recent.order.len() > RECENT_MAX
-                && let Some(old) = recent.order.pop_front()
-            {
-                recent.seen.remove(&old);
-            }
-        }
-    }
-
-    /// 最近见过的某条消息的发送人与时间。
-    pub(crate) fn recalled_from(&self, id: &str) -> Option<(Uid, i64)> {
-        self.recent.lock().expect("最近消息锁中毒").seen.get(id).cloned()
-    }
-
     /// 多一个后台任务（下线时一起停）。
     pub(crate) fn hold(&self, task: AbortHandle) {
         self.tasks.lock().expect("任务表锁中毒").push(task);
@@ -286,6 +260,7 @@ impl Server {
             avatar: self.photo.lock().expect("头像锁中毒").as_ref().map(super::profile::HostPhoto::self_key),
             tenant: None,
         };
+        let (devices, device_inbox) = super::devices::Devices::new();
         let live = Arc::new(Live {
             client,
             me,
@@ -296,13 +271,14 @@ impl Server {
             requests: Mutex::new(BTreeMap::new()),
             device_notes: Mutex::new(Vec::new()),
             outbox: Arc::new(push::Outbox::default()),
+            devices,
             names: Mutex::new(Names::new()),
             convs: Mutex::new(HashMap::new()),
-            recent: Mutex::new(Default::default()),
             tasks: Mutex::new(Vec::new()),
         });
         let tasks = push::start(self.clone(), live.clone(), updates);
         live.tasks.lock().expect("任务表锁中毒").extend(tasks);
+        live.hold(super::devices::start(self.clone(), live.clone(), device_inbox));
         if let Some(old) = self.state.write().await.replace(live.clone()) {
             old.close();
         }

@@ -45,7 +45,7 @@ impl ClientError {
         Self::Verify(message.into())
     }
 
-    pub(crate) fn state(message: impl Into<String>) -> Self {
+    pub fn state(message: impl Into<String>) -> Self {
         Self::State(message.into())
     }
 

@@ -1,7 +1,6 @@
 //! 对外的客户端：连上服务器、断线自动重连并补拉，把推送和补拉来的事件解开后交给上层。
 //!
-//! 所有操作和事件处理在同一把异步锁里串行执行（状态只有一份，不会一边换代一边用旧钥匙发消息）；
-//! 文件内容的上传下载不占这把锁，传大文件时照常收消息。
+//! 所有操作和事件处理在同一把异步锁里串行执行（状态只有一份，不会一边换代一边用旧钥匙发消息）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,12 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use friend_im_core::conv::GroupProfile;
-use friend_im_core::file::FileRef;
 use friend_im_core::ids::{ConvId, DeviceId, InviteId, MsgId, RequestId, Uid};
 use friend_im_core::keys::RecoveryKey;
-use friend_im_core::message::Content;
+use friend_im_core::message::{Content, Envelope};
+use friend_im_core::peer::SealedFrame;
 use friend_im_core::wire::{
-    AccountInfo, ConvSummary, DeviceInfo, DeviceStatus, ErrorCode, HelloAuth, JoinRequestInfo, Push,
+    AccountInfo, ConvSummary, DeviceInfo, DeviceStatus, ErrorCode, HelloAuth, JoinRequestInfo,
+    PeerInfo, Push, Request, Response,
 };
 use tokio::sync::mpsc;
 
@@ -22,21 +22,26 @@ use crate::book::Book;
 use crate::conn::{self, Conn};
 use crate::error::{ClientError, Result};
 use crate::keyring::Keyring;
-use crate::lan::{DirectInbound, Lan};
-use crate::links::{FriendLink, InviteLink, http_base, ws_url};
+use crate::lan::Lan;
+use crate::links::{FriendLink, InviteLink, ws_url};
 use crate::state::{Flow, State};
-use crate::types::{Config, ConvInfo, Credentials, HistoryPage, JoinStart, Update};
+use crate::sync::PeerFrame;
+use crate::types::{Config, ConvInfo, Credentials, JoinStart, Message, Notice, Update};
 
 /// 断线后第一次重连前等多久；之后每次翻倍，最多 [`RECONNECT_MAX`]。
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 /// 重连间隔上限。
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// 转交被限流时第一次等多久；之后每次翻倍。
+const RELAY_RETRY: Duration = Duration::from_millis(200);
+/// 转交被限流时最多试几次，再不行就当这次没送到，下一次对账再来。
+const RELAY_RETRIES: usize = 5;
 
 pub(crate) struct Inner {
     pub state: tokio::sync::Mutex<State>,
     conn: Mutex<Option<Arc<Conn>>>,
-    pub http: crate::web::Client,
-    pub base: String,
+    /// 最近一条连接，断了也留着：手里有签名链和钥匙时不用连接，断网也能封消息、验原件。
+    last: Mutex<Option<Arc<Conn>>>,
     ws: String,
     uid: Uid,
     device: DeviceId,
@@ -54,7 +59,14 @@ impl Inner {
             .ok_or(ClientError::Disconnected)
     }
 
+    fn last_conn(&self) -> Result<Arc<Conn>> {
+        self.last.lock().unwrap_or_else(|p| p.into_inner()).clone().ok_or(ClientError::Disconnected)
+    }
+
     fn set_conn(&self, conn: Option<Arc<Conn>>) {
+        if let Some(conn) = &conn {
+            *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(conn.clone());
+        }
         *self.conn.lock().unwrap_or_else(|p| p.into_inner()) = conn;
     }
 
@@ -117,7 +129,6 @@ impl Client {
             status: welcome.status,
         });
         let device = creds.device.id();
-        let base = http_base(&config.server);
         let state = State {
             config,
             creds,
@@ -125,7 +136,6 @@ impl Client {
             name: welcome.name.clone(),
             epoch: welcome.epoch,
             status: welcome.status,
-            reading: welcome.reading,
             friend_requests: welcome.friend_requests,
             sync_head: welcome.sync_head,
             position,
@@ -136,17 +146,14 @@ impl Client {
             approvals: HashMap::new(),
             updates,
             clock: connected.clock,
-            seen_messages: std::collections::HashSet::new(),
-            seen_order: std::collections::VecDeque::new(),
+            readings: Default::default(),
+            owners: HashMap::new(),
+            refreshed: HashMap::new(),
         };
         let inner = Arc::new(Inner {
             state: tokio::sync::Mutex::new(state),
             conn: Mutex::new(Some(connected.conn.clone())),
-            http: crate::web::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .build()
-                .map_err(|e| ClientError::Transfer(e.to_string()))?,
-            base,
+            last: Mutex::new(Some(connected.conn.clone())),
             ws,
             uid: welcome.uid,
             device,
@@ -167,17 +174,22 @@ impl Client {
         Ok((Self { inner }, rx))
     }
 
-    /// 当前连接（不占状态锁，文件传输用）。
-    pub(crate) fn inner_conn(&self) -> Result<Arc<Conn>> {
-        self.inner.conn()
-    }
-
     /// 在状态锁里用当前连接执行一个操作。
     pub(crate) async fn call<T>(
         &self,
         f: impl AsyncFnOnce(&mut State, &Conn) -> Result<T>,
     ) -> Result<T> {
         let conn = self.inner.conn()?;
+        let mut state = self.inner.state.lock().await;
+        f(&mut state, &conn).await
+    }
+
+    /// 同 [`Client::call`]，但断网时用最近一条连接：手里有的不用连接，要向服务器取的才回“没连上”。
+    pub(crate) async fn call_any<T>(
+        &self,
+        f: impl AsyncFnOnce(&mut State, &Conn) -> Result<T>,
+    ) -> Result<T> {
+        let conn = self.inner.last_conn()?;
         let mut state = self.inner.state.lock().await;
         f(&mut state, &conn).await
     }
@@ -400,79 +412,77 @@ impl Client {
 
     // ---------- 消息 ----------
 
-    /// 发消息，返回（日志序号，服务器时间）。同一次发送重试时用同一个 `id`。
-    pub async fn send(&self, conv: &ConvId, id: &MsgId, content: Content) -> Result<(u64, i64)> {
-        let lan = self.inner.lan.clone();
-        self.call(async move |s, c| s.send(c, conv, id, content, &lan).await)
-            .await
+    /// 按服务器的钟，现在是几点（毫秒）。
+    pub async fn now_ms(&self) -> i64 {
+        self.inner.state.lock().await.now_ms()
     }
 
-    /// 撤回自己的一条消息。
-    pub async fn recall(&self, conv: &ConvId, id: &MsgId, target: &MsgId) -> Result<(u64, i64)> {
-        self.send(
-            conv,
-            id,
-            Content::Recall {
-                target: target.clone(),
-            },
-        )
-        .await
+    /// 封一条消息，返回它的原件。`at` 是排序时间（[`friend_im_core::sync::next_at`]）。同一次发送重试时用同一个 `id`。
+    pub async fn seal(&self, conv: &ConvId, id: &MsgId, content: Content, at: i64) -> Result<(String, i64)> {
+        let (env, at) = self.call_any(async |s, c| s.seal(c, conv, id, content, at).await).await?;
+        Ok((crate::peers::record_of(&env)?, at))
     }
 
-    /// 往前翻一页历史（`before` 为空从最新开始）。
-    pub async fn history(
-        &self,
-        conv: &ConvId,
-        before: Option<u64>,
-        limit: u32,
-    ) -> Result<HistoryPage> {
-        self.history_in(conv, before, limit, None, None).await
+    /// 解开并核对一封信封。
+    pub(crate) async fn open_envelope(&self, env: Envelope) -> Result<Message> {
+        self.call_any(async |s, c| s.open_envelope(c, &env).await).await
     }
 
-    /// 同 [`Client::history`]，只要服务器时间在 `since_ms`～`until_ms` 之间的（毫秒，两端都含，可以只给一端）。
-    /// 系统提示没有服务器时间，按签它的人写的时间筛。
-    pub async fn history_in(
-        &self,
-        conv: &ConvId,
-        before: Option<u64>,
-        limit: u32,
-        since_ms: Option<i64>,
-        until_ms: Option<i64>,
-    ) -> Result<HistoryPage> {
-        self.call(async |s, c| {
-            s.history(c, conv, before, limit, (since_ms, until_ms))
-                .await
-        })
-        .await
+    /// 这个会话从头到现在的系统提示。
+    pub async fn notices(&self, conv: &ConvId) -> Result<Vec<Notice>> {
+        self.call_any(async |s, c| s.notices(c, conv).await).await
     }
 
-    /// 会话活动：自己所在的会话里 `since_ms` 起有消息的，每个会话最早、最新一条的服务器时间，按最新的从新到旧。
-    /// 只有会话编号和时间，用来尽早发现有新消息的会话（不解内容、不占发送额度）。
-    pub async fn activity(&self, since_ms: i64) -> Result<Vec<friend_im_core::wire::ConvActivity>> {
-        self.call(async |s, c| s.activity(c, since_ms).await).await
+    /// 这台设备能不能和我交换这个会话。
+    pub async fn may_share(&self, conv: &ConvId, peer: &DeviceId) -> bool {
+        self.call_any(async |s, c| Ok(s.may_share(c, conv, peer).await)).await.unwrap_or_default()
     }
 
-    /// 文件、图片：见 [`crate::files`]。
-    pub async fn upload(
-        &self,
-        conv: &ConvId,
-        reader: impl std::io::Read,
-        size: u64,
-        name: &str,
-        mime: &str,
-    ) -> Result<FileRef> {
-        crate::files::upload(self, conv, reader, size, name, mime).await
+    /// 这台设备是不是我自己账号的。
+    pub async fn owns_device(&self, device: &DeviceId) -> bool {
+        self.inner.state.lock().await.owners.get(device) == Some(&self.inner.uid)
     }
 
-    /// 下载并解密到 `out`。
-    pub async fn download(&self, file: &FileRef, out: &mut impl std::io::Write) -> Result<()> {
-        crate::files::download(self, file, out).await
+    /// 现在在线、能和我对账的设备。
+    pub async fn peers(&self) -> Result<Vec<PeerInfo>> {
+        let peers = self
+            .call(async |_, c| match c.request(Request::Peers).await? {
+                Response::Peers { peers } => Ok(peers),
+                _ => Err(ClientError::protocol("回执不对")),
+            })
+            .await?;
+        let mut state = self.inner.state.lock().await;
+        for peer in &peers {
+            state.owners.insert(peer.device.clone(), peer.uid.clone());
+        }
+        Ok(peers)
     }
 
-    /// 只读文件明文的 `offset` 起 `len` 字节（读到文件尾就少给）：只取盖住这一段的加密块，逐块核对后解开。
-    /// 给按段读、断了接着读的调用方用（插件的资源读取）；整份下载用 [`Client::download`]。
-    pub async fn read_range(&self, file: &FileRef, offset: u64, len: u64) -> Result<Vec<u8>> {
-        crate::files::read_range(self, file, offset, len).await
+    /// 发一帧给一台设备：能局域网直连就直连，不能就请服务器转交。返回送到了没有（对方不在线是 `false`，不算错）。
+    pub async fn send_frame(&self, to: &DeviceId, conv: Option<&ConvId>, frame: &PeerFrame) -> Result<bool> {
+        let sealed = self.call_any(async |s, c| s.seal_frame(c, to, frame).await).await?;
+        if self.inner.lan.deliver(to, &sealed).await {
+            return Ok(true);
+        }
+        self.relay(to, conv, sealed).await
+    }
+
+    async fn relay(&self, to: &DeviceId, conv: Option<&ConvId>, frame: SealedFrame) -> Result<bool> {
+        let conn = self.inner.conn()?;
+        let mut delay = RELAY_RETRY;
+        for _ in 0..RELAY_RETRIES {
+            let request = Request::Relay { to: to.clone(), conv: conv.cloned(), frame: frame.clone() };
+            match conn.request(request).await {
+                Ok(Response::Relayed { online }) => return Ok(online),
+                Ok(_) => return Err(ClientError::protocol("回执不对")),
+                Err(error) if error.code() == Some(ErrorCode::RateLimited) => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -480,7 +490,7 @@ impl Client {
 async fn supervise(
     inner: Arc<Inner>,
     mut pushes: mpsc::Receiver<Push>,
-    mut direct: mpsc::UnboundedReceiver<DirectInbound>,
+    mut direct: mpsc::UnboundedReceiver<SealedFrame>,
 ) {
     // 局域网直连没起来（`Lan::disabled`）时发送端已经扔了：通道一关就不再等它，否则 `recv` 每次立刻回 `None`，循环空转占满一个核。
     let mut direct_open = true;
@@ -507,13 +517,13 @@ async fn supervise(
                         return;
                     }
                 }
-                message = direct.recv(), if direct_open => {
-                    let Some(message) = message else {
+                frame = direct.recv(), if direct_open => {
+                    let Some(frame) = frame else {
                         direct_open = false;
                         continue;
                     };
                     let mut state = inner.state.lock().await;
-                    state.handle_direct(&conn, message).await;
+                    state.handle_frame(&conn, frame).await;
                 }
             }
         }
@@ -581,7 +591,6 @@ async fn reconnect(inner: &Arc<Inner>) -> Result<mpsc::Receiver<Push>> {
         state.keys.clear();
     }
     state.status = welcome.status;
-    state.reading = welcome.reading;
     state.friend_requests = welcome.friend_requests;
     state.sync_head = welcome.sync_head;
     state.epoch = welcome.epoch;

@@ -70,27 +70,16 @@ pub struct Message {
     pub conv: ConvId,
     /// 消息编号（发送的电脑取的，撤回、回复都用它）。
     pub id: MsgId,
-    /// 服务器日志序号（同一会话里按它排序）。
-    pub log: u64,
-    /// 服务器收到的时间（毫秒）。
-    pub ts_ms: i64,
     /// 发送账号。
     pub sender: Uid,
     /// 发送账号当时的身份指纹。
     pub sender_eldest: Fixed<32>,
     /// 发送的电脑。
     pub device: DeviceId,
-    /// 发送时发送方的本机时间（毫秒；被撤回的消息为 0）。
+    /// 排序时间：发送方签名的毫秒时间，所有设备按它（再按编号）排出同一顺序。
     pub ctime_ms: i64,
-    /// 内容；被撤回的消息服务器上已删掉密文，为空。
-    pub content: Option<Content>,
-}
-
-impl Message {
-    /// 这条是否已被撤回（服务器上的内容已删）。
-    pub fn recalled(&self) -> bool {
-        self.content.is_none()
-    }
+    /// 内容。
+    pub content: Content,
 }
 
 /// 会话里的一条系统提示（来自会话签名链，按日志序号和消息排在一起）。
@@ -222,8 +211,24 @@ pub enum AccountNotice {
 /// 推给上层的更新。
 #[derive(Clone, Debug)]
 pub enum Update {
-    /// 阅读事实变了；上层只读补查，不作为新消息或本人查看。
-    ReadingChanged { conv: ConvId },
+    /// 别的设备发来一帧（已验过发送设备属于这个账号）。
+    Frame {
+        /// 发送账号。
+        uid: Uid,
+        /// 发送设备。
+        from: DeviceId,
+        /// 帧。
+        frame: crate::sync::PeerFrame,
+    },
+    /// 一台能和我对账的设备上线或下线了。
+    Presence {
+        /// 账号。
+        uid: Uid,
+        /// 设备。
+        device: DeviceId,
+        /// 在线吗。
+        online: bool,
+    },
     /// 好友申请变化；重新查询当前账号的列表。
     FriendRequestsChanged,
     /// 连上了服务器。
@@ -231,29 +236,12 @@ pub enum Update {
         /// 这台电脑的状态。
         status: DeviceStatus,
     },
-    /// 断开了，正在重连（已收到的消息照常能看，发送会失败）。
+    /// 断开了，正在重连（已收到的消息照常能看）。
     Disconnected,
     /// 这台电脑刚变成可用（开通、被批准、用恢复密钥加入、重置后）。
     Activated,
     /// 处理到了哪个日志序号：上层随事件把它存成同步位置，下次从这里接着补。
     Position(u64),
-    /// 一条消息。
-    Message(Message),
-    /// 一条消息解不开或验不过（服务器给的东西不对）：上层显示一条提示，不当成正常消息。
-    MessageRejected {
-        /// 会话。
-        conv: ConvId,
-        /// 消息编号。
-        id: MsgId,
-        /// 日志序号。
-        log: u64,
-        /// 服务器收到的时间（毫秒）。
-        ts_ms: i64,
-        /// 信封上写的发送账号（没验过，只用来把提示放在对的人名下）。
-        sender: Uid,
-        /// 原因（不含内容）。
-        reason: String,
-    },
     /// 会话里的系统提示（也是“这个会话变了”的信号：新会话第一次出现时就是它的建会话提示）。
     Conv(Notice),
     /// 会话签名链验不过（服务器私自加成员等）：拒绝并提醒用户（契约 §5）。
@@ -310,48 +298,6 @@ pub enum Update {
     DeviceRemoved,
     /// 登录凭证失效，客户端已停止，需要重新登录。
     LoggedOut,
-}
-
-/// 翻历史的一项。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HistoryItem {
-    /// 消息。
-    Message(Message),
-    /// 解不开或验不过的消息。
-    Rejected {
-        /// 消息编号。
-        id: MsgId,
-        /// 日志序号。
-        log: u64,
-        /// 服务器收到的时间（毫秒）。
-        ts_ms: i64,
-        /// 信封上写的发送账号（没验过，只用来把提示放在对的人名下）。
-        sender: Uid,
-        /// 原因。
-        reason: String,
-    },
-    /// 系统提示。
-    Notice(Notice),
-}
-
-impl HistoryItem {
-    /// 日志序号。
-    pub fn log(&self) -> u64 {
-        match self {
-            Self::Message(m) => m.log,
-            Self::Rejected { log, .. } => *log,
-            Self::Notice(n) => n.log,
-        }
-    }
-}
-
-/// 一页历史（从新到旧）。
-#[derive(Clone, Debug, Default)]
-pub struct HistoryPage {
-    /// 消息与系统提示，按日志序号从新到旧。
-    pub items: Vec<HistoryItem>,
-    /// 是否还有更早的。
-    pub more: bool,
 }
 
 /// 一个会话的现状（按验过的签名链）。

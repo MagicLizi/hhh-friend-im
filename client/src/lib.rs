@@ -1,9 +1,11 @@
-//! Cindy IM 客户端库：连服务器、核对签名链、钥匙缓存、同步与断线重连。不认识 HHH 协议，插件把它翻成 HHH 的插件协议。
+//! Cindy IM 客户端库：连服务器、核对签名链、钥匙缓存、控制面同步与断线重连、设备之间的对账引擎。
+//! 不认识 HHH 协议，插件把它翻成 HHH 的插件协议。
 //!
-//! - 只认自己验过的东西：服务器给的账号签名链、会话签名链、钥匙封装、消息，每一样都按 `friend-im-core` 的规则核对，
-//!   对不上就报 [`ClientError::Verify`] 或推 [`Update::ConvRejected`] / [`Update::MessageRejected`]，不当成正常内容。
-//! - 不存聊天记录：要长期保存的只有 [`Credentials`]（电脑私钥 + 服务器登录凭证，交给 HHH 存系统凭据库）
-//!   和同步位置（[`Update::Position`]）；账号钥匙、会话钥匙每次连上后从服务器取回再解，内存里的缓存都有上限。
+//! - 只认自己验过的东西：服务器给的账号签名链、会话签名链、钥匙封装，别的设备给的原件，每一样都按 `friend-im-core` 的规则
+//!   核对，对不上就报 [`ClientError::Verify`] 或推 [`Update::ConvRejected`]，不当成正常内容。
+//! - 不存聊天记录：消息由宿主替插件保存、设备之间对账补齐（[`sync`]、[`peers`]）。要长期保存的只有 [`Credentials`]
+//!   （电脑私钥 + 服务器登录凭证，交给 HHH 存系统凭据库）和控制面的同步位置（[`Update::Position`]）；
+//!   账号钥匙、会话钥匙每次连上后从服务器取回再解，内存里的缓存都有上限。
 //! - 断线自动重连，从同步位置补拉，不漏不重。
 //!
 //! # Examples
@@ -23,10 +25,11 @@
 //! # let friend_link = link.clone();
 //! let dm = client.add_friend(&friend_link).await?;
 //! let text = Content::Post { parts: vec![Part::Text { text: "你好".into() }], reply_to: None };
-//! client.send(&dm, &MsgId::random(), text).await?;
+//! let (raw, _at) = client.seal(&dm, &MsgId::random(), text, 1_700_000_000_000).await?; // 交给对账引擎写进宿主、投给在线设备
+//! # let _ = raw;
 //! while let Some(update) = updates.recv().await {
-//!     if let Update::Message(message) = update {
-//!         println!("{} 发来一条消息", message.sender);
+//!     if let Update::Frame { from, .. } = update {
+//!         println!("{from} 发来一帧");
 //!     }
 //! }
 //! # Ok(())
@@ -37,20 +40,21 @@ mod book;
 mod client;
 mod conn;
 mod error;
-mod files;
 mod friends;
 mod keyring;
 mod lan;
 mod links;
 mod ops_account;
 mod ops_conv;
+pub mod peers;
 mod reading;
 mod state;
+pub mod sync;
 mod types;
 #[cfg(target_os = "wasi")]
 mod wasi_net;
 
-/// HTTP 客户端（文件上传下载、取头像）：原生构建就是 reqwest；WASI 构建是 `web_wasi.rs` 里接口同名的小实现，
+/// HTTP 客户端（取头像）：原生构建就是 reqwest；WASI 构建是 `web_wasi.rs` 里接口同名的小实现，
 /// 调用处不分平台。
 #[cfg(not(target_os = "wasi"))]
 pub use reqwest as web;
@@ -64,8 +68,7 @@ pub use friends::{FriendRequestInfo, FriendRequestPage};
 pub use links::{FriendLink, InviteLink};
 pub use reading::{MessageReceipt, ReadingMark};
 pub use types::{
-    AccountNotice, Config, ConvInfo, ConvNotice, Credentials, HistoryItem, HistoryPage, JoinStart,
-    Message, Notice, Update,
+    AccountNotice, Config, ConvInfo, ConvNotice, Credentials, JoinStart, Message, Notice, Update,
 };
 
 /// 两边共用的格式（编号、消息内容、群资料等），原样转出，插件不用另外依赖。

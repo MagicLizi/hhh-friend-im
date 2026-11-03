@@ -1,4 +1,5 @@
-//! 推送（protocol-v1 §11）：客户端库推来的更新翻成协议的事件，排进一条队列，由一个任务一批一批推给宿主。
+//! 推送（protocol-v1 §11）：客户端库推来的控制面更新翻成协议的事件，排进一条队列，由一个任务一批一批推给宿主。
+//! 消息不走这里：设备对账写进宿主时直接推，宿主回了才算写好（[`super::devices`]）。
 //!
 //! - 同一时间只有一批在途：宿主写进本地库、回复了才算送到，才推下一批；出错或 30 秒没回复就隔一会儿原样重推
 //!   （宿主按编号去重）。一批至多 500 个事件。
@@ -13,13 +14,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use friend_im_client::core::ids::{ConvId, MsgId, Uid};
+use friend_im_client::core::ids::{ConvId, Uid};
 use friend_im_client::core::message::Content;
 use friend_im_client::core::wire::DeviceStatus;
-use friend_im_client::{AccountNotice, ConvNotice, HistoryItem, Message, Notice, Update, Updates};
+use friend_im_client::sync::PeerFrame;
+use friend_im_client::{AccountNotice, ConvNotice, Message, Notice, Update, Updates};
 use hhh_im_protocol::method::{ConnState, EventsPushParams, SessionExpiredParams, StatusParams};
 use hhh_im_protocol::rpc::ReauthReason;
-use hhh_im_protocol::types::{Event, Message as Wire, Person, PersonKind};
+use hhh_im_protocol::types::{Event, Person, PersonKind};
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 
@@ -30,10 +32,6 @@ use super::translate;
 
 /// 一批至多几个事件（protocol-v1 §11.1）。
 const BATCH_MAX: usize = 500;
-/// 撤回推来、原来那条不在最近见过的消息里时，往前翻几页历史找它（每页 100 条）。
-const RECALL_SEARCH_PAGES: usize = 5;
-/// 回到以前待过的群时，往前翻几页找自己离开的那条（每页 100 条），补推不在的那段。
-const REJOIN_BACKFILL_PAGES: usize = 20;
 
 /// 等着推给宿主的事件。
 #[derive(Default)]
@@ -127,27 +125,11 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
                         .notify("contacts/requestsChanged", serde_json::json!({}));
                 }
             }
-            Update::ReadingChanged { conv } => {
-                if server
-                    .reading_events
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    match live.client.reading_through(&conv).await {
-                        Ok(through) => server.peer.notify(
-                            "reading/changed",
-                            hhh_im_protocol::reading::ReadState {
-                                scope: hhh_im_protocol::reading::ReadScope {
-                                    conversation_id: conv.to_string(),
-                                    thread_root: None,
-                                },
-                                through: through.map(|p| p.to_string()),
-                                read_message_ids: Vec::new(),
-                            },
-                        ),
-                        Err(error) => tracing::warn!(%error,"阅读变更未核实，保留原未读"),
-                    }
-                }
-            }
+            Update::Frame { from, frame, .. } => match frame {
+                PeerFrame::FileChunk { .. } | PeerFrame::FileMissing { .. } => live.devices.file_answer(frame),
+                frame => live.devices.frame(from, frame),
+            },
+            Update::Presence { device, online, .. } => live.devices.presence(device, online),
             Update::Connected { status } => {
                 server.peer.notify(
                     "status",
@@ -159,10 +141,12 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
                 if status != DeviceStatus::Active {
                     tracing::warn!(?status, "重连后这台电脑不能用了");
                 }
+                live.devices.connected();
                 let live = live.clone();
                 tokio::spawn(async move { drop_groups_left_by_reset(&live).await });
             }
             Update::Disconnected => {
+                live.devices.disconnected();
                 server.peer.notify(
                     "status",
                     StatusParams {
@@ -172,35 +156,10 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
                 );
             }
             Update::Position(log) => outbox.position(log),
-            Update::Message(message) => on_message(&live, &outbox, message).await,
-            Update::MessageRejected {
-                conv,
-                id,
-                ts_ms,
-                sender,
-                ..
-            } => {
-                ensure_conversation(&live, &outbox, &conv).await;
-                let names = live.names([sender.clone()]).await;
-                let wire = translate::unreadable(conv.as_str(), &id, &sender, ts_ms, &names);
-                outbox.push(Event::Messages {
-                    conversation_id: conv.to_string(),
-                    messages: vec![wire],
-                });
-            }
             Update::Conv(notice) => {
-                // 刚进的会话：发一条个人资料；以前待过、这次是回来的，补推不在的那段（都在后台做，不挡推送）。
-                if joined(&live.me, &notice) {
-                    let (server, live, conv, log) = (
-                        server.clone(),
-                        live.clone(),
-                        notice.conv.clone(),
-                        notice.log,
-                    );
-                    tokio::spawn(async move {
-                        server.announce_to(&live, &conv).await;
-                        backfill_rejoined(&live, &conv, log).await;
-                    });
+                // 成员变了：和在线的成员对一遍账（新成员拿到全部旧消息），互相交个人资料。
+                if matches!(notice.change, ConvNotice::Created { .. } | ConvNotice::Added { .. } | ConvNotice::JoinedByInvite) {
+                    live.devices.changed(notice.conv.clone());
                 }
                 on_notice(&live, &outbox, notice).await;
             }
@@ -243,7 +202,8 @@ async fn translate_updates(server: Arc<Server>, live: Arc<Live>, mut updates: Up
                 _ => {}
             },
             // 聊过的人重置账号：会话里的系统提示另外推来（MemberReset），这里不用管。
-            Update::Account { .. } | Update::Activated | Update::JoinWrongCode { .. } => {}
+            Update::Activated => live.devices.connected(),
+            Update::Account { .. } | Update::JoinWrongCode { .. } => {}
             Update::JoinRequested(info) => server.join_requested(&live, info),
             Update::JoinRequests(requests) => server.requests_refreshed(&live, requests),
             Update::JoinApproved { request } => server
@@ -273,38 +233,10 @@ async fn push_conversation(live: &Live, outbox: &Outbox, conv: &ConvId) {
     }
 }
 
-async fn on_message(live: &Live, outbox: &Outbox, message: Message) {
-    if let Some(Content::Profile { avatar, photo }) = &message.content {
-        // 个人资料不是给人看的消息：记下这个人的头像，变了就告诉宿主（人与私聊会话）。
-        let key = super::profile::profile_key(avatar.as_deref(), photo.as_ref());
-        profile_seen(live, &message.sender, message.log, key).await;
-        return;
-    }
-    ensure_conversation(live, outbox, &message.conv).await;
-    if let Some(Content::Recall { target }) = &message.content {
-        if let Some(wire) = recalled(live, &message, target).await {
-            outbox.push(Event::Messages {
-                conversation_id: message.conv.to_string(),
-                messages: vec![wire],
-            });
-        }
-        return;
-    }
-    let names = live.names(mentioned(&message)).await;
-    let Some(wire) = translate::message(&message, &names) else {
-        return;
-    };
-    live.remember(&wire.id, &message.sender, message.ts_ms);
-    outbox.push(Event::Messages {
-        conversation_id: message.conv.to_string(),
-        messages: vec![wire],
-    });
-}
-
-/// 见到一份个人资料（推来的或翻历史翻到的，头像键见 `profile::profile_key`）：比记下的新、头像变了就推这个人与
+/// 见到一份个人资料（头像键见 `profile::profile_key`，`at` 是它的发送时间）：比记下的新、头像变了就推这个人与
 /// 和他的私聊。
-pub(crate) async fn profile_seen(live: &Live, sender: &Uid, log: u64, key: Option<String>) {
-    if *sender == live.me || !live.profiles.note(sender, log, key) {
+pub(crate) async fn profile_seen(live: &Live, sender: &Uid, at: u64, key: Option<String>) {
+    if *sender == live.me || !live.profiles.note(sender, at, key) {
         return;
     }
     push_person(live, sender).await;
@@ -336,7 +268,7 @@ async fn push_person(live: &Live, uid: &Uid) {
 /// 一条消息里要显示名字的人：发送人与被提及的人。
 pub(crate) fn mentioned(message: &Message) -> Vec<Uid> {
     let mut uids = vec![message.sender.clone()];
-    if let Some(Content::Post { parts, .. }) = &message.content {
+    if let Content::Post { parts, .. } = &message.content {
         uids.extend(parts.iter().filter_map(|p| match p {
             friend_im_client::core::message::Part::Mention { uid: Some(uid), .. } => {
                 Some(uid.clone())
@@ -345,49 +277,6 @@ pub(crate) fn mentioned(message: &Message) -> Vec<Uid> {
         }));
     }
     uids
-}
-
-/// 撤回推来：报原来那条变成“已撤回”（时间与发送人照原来那条，宿主按编号覆盖）。最近没见过就往前翻几页找。
-async fn recalled(live: &Live, recall: &Message, target: &MsgId) -> Option<Wire> {
-    let found = match live.recalled_from(target.as_str()) {
-        Some(found) => Some(found),
-        None => search(live, recall, target).await,
-    };
-    let Some((sender, ts_ms)) = found else {
-        tracing::info!(conv = %recall.conv, "撤回的那条往前翻也没找到，等宿主下次读历史时更新");
-        return None;
-    };
-    let names = live.names([sender.clone()]).await;
-    Some(translate::recalled(
-        recall.conv.as_str(),
-        target,
-        &sender,
-        ts_ms,
-        &names,
-    ))
-}
-
-async fn search(live: &Live, recall: &Message, target: &MsgId) -> Option<(Uid, i64)> {
-    let mut before = Some(recall.log);
-    for _ in 0..RECALL_SEARCH_PAGES {
-        let page = live.client.history(&recall.conv, before, 100).await.ok()?;
-        for item in &page.items {
-            match item {
-                HistoryItem::Message(m) if &m.id == target => {
-                    return Some((m.sender.clone(), m.ts_ms));
-                }
-                HistoryItem::Rejected {
-                    id, sender, ts_ms, ..
-                } if id == target => return Some((sender.clone(), *ts_ms)),
-                _ => {}
-            }
-        }
-        if !page.more {
-            return None;
-        }
-        before = page.items.iter().map(HistoryItem::log).min();
-    }
-    None
 }
 
 /// 重置过账号就退出了所有群（契约 S7）：还记着我旧身份的群推“会话没有了”（宿主只记下，不删本地记录）。每次连上看一次，
@@ -411,75 +300,6 @@ fn left(me: &Uid, notice: &Notice) -> bool {
     match &notice.change {
         ConvNotice::Left => notice.author == *me,
         ConvNotice::Removed { uid, .. } => uid == me,
-        _ => false,
-    }
-}
-
-/// 回到以前待过的群（被移出或退群后又被邀请、凭链接回来，契约 S12）：宿主本机已有在群期间的消息，只缺不在的那段——
-/// 从这次加入往前翻到自己离开的那条，把这段的消息与提示补推给宿主（宿主按编号去重，推重了也不会多一条）。
-/// 翻到头也没见自己离开过的，是第一次进：什么也不推，宿主打开会话时自己从头读历史。最多翻 [`REJOIN_BACKFILL_PAGES`] 页。
-async fn backfill_rejoined(live: &Live, conv: &ConvId, joined_log: u64) {
-    let mut before = Some(joined_log);
-    let mut missed = Vec::new();
-    for _ in 0..REJOIN_BACKFILL_PAGES {
-        let page = match live.client.history(conv, before, 100).await {
-            Ok(page) => page,
-            Err(error) => {
-                tracing::info!(%conv, %error, "回到群里，补推不在的那段时读历史没成");
-                return;
-            }
-        };
-        for item in &page.items {
-            if let HistoryItem::Notice(notice) = item
-                && left(&live.me, notice)
-            {
-                tracing::info!(%conv, count = missed.len(), "回到群里，补推不在的那段");
-                for item in missed.into_iter().rev() {
-                    push_history_item(live, conv, item).await;
-                }
-                return;
-            }
-            missed.push(item.clone());
-        }
-        if !page.more {
-            return;
-        }
-        before = page.items.iter().map(HistoryItem::log).min();
-    }
-    tracing::info!(%conv, "回到群里，往前翻了几页没找到离开的那条，不补推");
-}
-
-/// 翻历史翻到的一项照推来的推给宿主：消息、解不开的消息、系统提示。
-async fn push_history_item(live: &Live, conv: &ConvId, item: HistoryItem) {
-    match item {
-        HistoryItem::Message(message) => on_message(live, &live.outbox, message).await,
-        HistoryItem::Rejected {
-            id, ts_ms, sender, ..
-        } => {
-            let names = live.names([sender.clone()]).await;
-            let wire = translate::unreadable(conv.as_str(), &id, &sender, ts_ms, &names);
-            live.outbox.push(Event::Messages {
-                conversation_id: conv.to_string(),
-                messages: vec![wire],
-            });
-        }
-        HistoryItem::Notice(notice) => {
-            let names = live.names(translate::notice_people(&notice)).await;
-            if let Some(wire) = translate::notice(&notice, &names, &live.me) {
-                live.outbox.push(Event::Messages {
-                    conversation_id: conv.to_string(),
-                    messages: vec![wire],
-                });
-            }
-        }
-    }
-}
-
-/// 这条提示是不是“我进了这个会话”（建会话时在成员里、被邀请、凭链接加入）。
-fn joined(me: &Uid, notice: &Notice) -> bool {
-    match &notice.change {
-        ConvNotice::Created { members, .. } | ConvNotice::Added { members } => members.contains(me),
-        ConvNotice::JoinedByInvite => notice.author == *me,
         _ => false,
     }
 }
@@ -516,6 +336,38 @@ async fn on_notice(live: &Live, outbox: &Outbox, notice: Notice) {
         outbox.push(Event::ConversationRemoved {
             conversation_id: conv.to_string(),
         });
+    }
+}
+
+impl super::Server {
+    /// 把全部会话的系统提示补给宿主：它们来自签名链，所有设备一样；新设备靠这个有提示，宿主按编号去重。
+    pub(crate) async fn backfill_notices(&self, live: &Live) {
+        let convs = match live.client.convs().await {
+            Ok(convs) => convs,
+            Err(error) => {
+                tracing::info!(%error, "会话列表取不到，系统提示下次再补");
+                return;
+            }
+        };
+        for summary in convs.into_iter().filter(|summary| summary.member) {
+            let notices = match live.client.notices(&summary.conv).await {
+                Ok(notices) => notices,
+                Err(error) => {
+                    tracing::info!(conv = %summary.conv, %error, "这个会话的系统提示取不到");
+                    continue;
+                }
+            };
+            ensure_conversation(live, &live.outbox, &summary.conv).await;
+            for notice in notices {
+                let names = live.names(translate::notice_people(&notice)).await;
+                if let Some(wire) = translate::notice(&notice, &names, &live.me) {
+                    live.outbox.push(Event::Messages {
+                        conversation_id: summary.conv.to_string(),
+                        messages: vec![wire],
+                    });
+                }
+            }
+        }
     }
 }
 
