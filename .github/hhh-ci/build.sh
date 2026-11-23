@@ -9,9 +9,10 @@ set -euo pipefail
 target="$HHH_TARGET"
 triple="$HHH_RUST_TARGET"
 
-# 这次编进去的包（cargo 的 JSON 消息），放 target/ 里：不进上传的 dist/，Windows 上也不用换路径写法。
-mkdir -p target
-units="target/hhh-build-units-$target.json"
+# 自托管 runner 通过 CARGO_TARGET_DIR 复用本机构建缓存。
+target_dir="${CARGO_TARGET_DIR:-target}"
+mkdir -p "$target_dir"
+units="$target_dir/hhh-build-units-$target.json"
 # shellcheck disable=SC2086 # 额外参数按空格分开
 cargo build --release --locked --target "$triple" ${HHH_CARGO_ARGS:-} --message-format=json-render-diagnostics > "$units"
 
@@ -44,6 +45,6 @@ if [ -n "${HHH_LOGO:-}" ]; then
     mkdir -p "$stage/$(dirname "$HHH_LOGO")"
     cp "$HHH_LOGO" "$stage/$HHH_LOGO"
 fi
-cp "target/$triple/release/$HHH_BINARY$HHH_EXT" "$stage/"
+cp "$target_dir/$triple/release/$HHH_BINARY$HHH_EXT" "$stage/"
 echo "已放进 ${stage}："
 ls -la "$stage"

@@ -27,7 +27,7 @@ permissions:
 
 concurrency:
   group: hhh-plugin-${{ github.event_name }}-${{ github.ref }}-${{ inputs.request }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,8 +36,8 @@ env:
 jobs:
   plan:
     name: 读配置
-    # 读配置、合包、建草稿：设了 Mac 机器（Actions 变量 HHH_RUNNER_MACOS）就在它上面跑，没设用 GitHub 的 Linux 机器。
-    runs-on: ${{ vars.HHH_RUNNER_MACOS && fromJSON(format('["self-hosted","{0}"]', vars.HHH_RUNNER_MACOS)) || 'ubuntu-latest' }}
+    # 读配置、合包与上传草稿无需编译目标平台的程序。
+    runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       targets: ${{ steps.plan.outputs.targets }}
@@ -78,7 +78,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: 使用本机构建缓存
+        if: runner.environment == 'self-hosted'
+        env:
+          HHH_TARGET: ${{ matrix.target }}
+        run: |
+          # PR 与 main 各用各的构建目录。目录放在 checkout 清理范围之外。
+          scope=checks
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then scope=main; fi
+          cache="$HOME/.hhh-ci-target/$GITHUB_REPOSITORY/$RUNNER_NAME/$scope/$HHH_TARGET"
+          mkdir -p "$cache"
+          if command -v cygpath >/dev/null 2>&1; then cache="$(cygpath -m "$cache")"; fi
+          echo "CARGO_TARGET_DIR=$cache" >> "$GITHUB_ENV"
+
       - name: 缓存 cargo
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v6
         with:
           path: |
@@ -94,7 +108,7 @@ jobs:
         run: bash .github/hhh-ci/wasi-sdk.sh
 
       - name: 缓存自检工具
-        if: matrix.native
+        if: matrix.native && runner.environment == 'github-hosted'
         uses: actions/cache@v6
         with:
           path: ~/.hhh-im-tools
@@ -148,7 +162,7 @@ jobs:
   assemble:
     name: 合包与核对
     needs: [plan, build]
-    runs-on: ${{ vars.HHH_RUNNER_MACOS && fromJSON(format('["self-hosted","{0}"]', vars.HHH_RUNNER_MACOS)) || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -187,7 +201,7 @@ jobs:
     name: 建草稿 Release
     if: needs.plan.outputs.release == 'true'
     needs: [plan, assemble]
-    runs-on: ${{ vars.HHH_RUNNER_MACOS && fromJSON(format('["self-hosted","{0}"]', vars.HHH_RUNNER_MACOS)) || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
